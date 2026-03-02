@@ -6,10 +6,12 @@ class BitReader {
 
   BitReader(this.data);
 
+  bool get eof => (_bit >> 3) >= data.length;
   int get bitPos => _bit;
-  int get bytePos => _bit >> 3;
-
-  bool get eof => (bytePos) >= data.length;
+  int get bitsLeft {
+    final left = data.length * 8 - _bit;
+    return left > 0 ? left : 0;
+  }
 
   int readBit() => readBits(1);
 
@@ -17,10 +19,9 @@ class BitReader {
     int v = 0;
     for (int i = 0; i < n; i++) {
       final bi = _bit >> 3;
-      if (bi >= data.length) return v; // soft EOF
+      if (bi >= data.length) return v;
       final shift = 7 - (_bit & 7);
-      final b = (data[bi] >> shift) & 1;
-      v = (v << 1) | b;
+      v = (v << 1) | ((data[bi] >> shift) & 1);
       _bit++;
     }
     return v;
@@ -33,11 +34,11 @@ class BitReader {
 
   Uint8List readBytes(int n) {
     byteAlign();
-    final start = bytePos;
+    final start = _bit >> 3;
     final end = start + n;
-    if (start >= data.length) return Uint8List(0);
     final safeEnd = end > data.length ? data.length : end;
     _bit += (safeEnd - start) * 8;
+    if (start >= data.length) return Uint8List(0);
     return data.sublist(start, safeEnd);
   }
 }

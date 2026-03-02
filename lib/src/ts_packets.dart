@@ -17,6 +17,7 @@ Iterable<TsPacket> parseTsPackets(Uint8List data) sync* {
   for (int off = 0; off + packetSize <= data.length; off += packetSize) {
     final p = data.sublist(off, off + packetSize);
     if (p[0] != 0x47) continue;
+    if ((p[1] & 0x80) != 0) continue; // transport_error_indicator
 
     final payloadUnitStart = (p[1] & 0x40) != 0;
     final pid = ((p[1] & 0x1F) << 8) | p[2];

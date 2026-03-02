@@ -1,128 +1,235 @@
-# ndvy_player
+# NDVY Player — Pure Dart Video Playback (MP4 First)
 
-Custom Dart-native video player project in Flutter.
+This project is an experiment to build a **pure Dart** video playback pipeline (no `video_player`, no native codecs).
+Because HLS+TS adds a lot of complexity, we first validate the decoder using **MP4** (clean sample boundaries).
+After MP4 works, we return to HLS/TS with confidence.
 
-This repository is not only about IDR thumbnails.  
-The product direction is a full custom player stack written in Dart:
+---
 
-- HLS playlist handling
-- MPEG-TS demux
-- PES extraction
-- H.264 parsing/decoding
-- YUV to RGB conversion
-- Flutter rendering
-- Later: timeline playback, P/B frames, audio, and performance optimization
+## Goal
 
-## Scope And Milestones
+✅ Render a **correct picture** from H.264 Baseline streams using pure Dart.
 
-Milestone A is the first vertical slice of the larger custom-player vision.
+Non-goals (for now):
+- Audio decode (AAC)
+- P-frames / motion compensation
+- Hardware acceleration
+- Full HLS live streaming features
 
-Milestone A target:
+---
 
-- Load HLS stream
-- Parse TS + extract H.264
-- Decode IDR/keyframes
-- Render still-frame thumbnails
-- No audio, no full timeline playback yet
+## Why MP4 First?
 
-Primary planning docs:
+HLS TS pipeline includes:
+- playlist logic
+- TS packets
+- PAT/PMT PID detection
+- PES reassembly
+- PTS stitching
+- access unit boundary detection
 
-- `📄 PROJECT_SCOPE_MILESTONE_A.md`
-- `ARCHITECTURE.md`
-- `TASK_BREAKDOWN.md`
-- `SPRINT_PLAN.md`
-- `H264_DECODER_DESIGN.md`
+MP4 removes most of that and lets us focus on:
+- MP4 demux
+- H.264 NAL extraction
+- decoder correctness
+- renderer correctness
 
-## Current Implementation
+---
 
-Implemented pipeline pieces:
+## Project Structure (Suggested)
 
-- HLS master/media parsing
-- TS packet parsing, PAT/PMT parsing
-- Video PID extraction and PES to ES extraction
-- Annex-B NAL splitting and IDR access unit grouping
-- SPS parsing for frame dimensions
-- Thumbnail rendering workflow in Flutter UI with state logs
+---
+mp4/
+  mp4_demux.dart
+  mp4_boxes.dart
+  mp4_samples.dart
 
-Current decode path in app:
+h264/
+  bitreader.dart
+  exp_golomb.dart
+  rbsp.dart
+  sps.dart
+  pps.dart
+  cavlc.dart
+  cavlc_coeff_token_tables.dart
+  inv_transform.dart
+  h264_baseline_idr_decoder.dart
 
-- Uses `h264` plugin for Android hardware-assisted frame decode
-- Writes IDR AU to temporary `.h264` file and decodes to image
-- Displays decoded images as thumbnails
+yuv/
+  yuv420_to_rgba.dart
 
-Work still in progress for full custom player:
+---
 
-- Pure Dart IDR slice reconstruction (CAVLC + intra prediction)
-- Continuous playback engine
-- P/B frame support
-- Audio decode/sync
-- Isolate-based performance pipeline
 
-## Patched `h264` Dependency
+---
 
-The project keeps `h264` enabled with a local patched copy:
+## Milestones
 
-- `third_party/h264_0_3_0`
+### M0 — MP4 Mode Switch + Debug Overlay
+**Goal:** Add MP4 build path without touching the decoder.
 
-`pubspec.yaml` contains:
+Features:
+- [ ] Add UI button: **Build Queue (MP4)**
+- [ ] Keep existing: Play / Pause / Seek
+- [ ] Debug overlay:
+  - [ ] Frame width/height
+  - [ ] avgY/minY/maxY
+  - [ ] PPS entropyCodingModeFlag (CABAC check)
+  - [ ] Queue size and current PTS
 
-- `h264: ^0.3.0`
-- `dependency_overrides.h264.path: third_party/h264_0_3_0`
+Done when:
+- MP4 queue builds and playback loop runs
+- At least 30 frames in queue
 
-Patch reason:
+---
 
-- Upstream `h264-0.3.0` Android module is not compatible with current AGP defaults (`namespace` requirement)
-- Plugin code needed cleanup for modern Flutter embedding compatibility
+### M1 — Minimal MP4 Demux (Video Only, avc1)
+**Goal:** Parse MP4 boxes enough to extract video samples.
 
-## Requirements
+Features:
+- [ ] Parse MP4 top-level boxes:
+  - [ ] `ftyp` (optional)
+  - [ ] `moov`
+  - [ ] `trak` (video)
+- [ ] Parse sample tables:
+  - [ ] `stsz` sample sizes
+  - [ ] `stco` or `co64` chunk offsets
+  - [ ] `stsc` sample-to-chunk map
+  - [ ] `stts` decode time deltas (PTS)
+  - [ ] `ctts` (optional, skip first version)
+- [ ] Parse codec config:
+  - [ ] `stsd` -> `avc1` -> `avcC`
+  - [ ] Extract SPS/PPS
+  - [ ] Read NAL length prefix size (1/2/4 bytes)
 
-- Flutter SDK (`fvm` commands are used in this repo)
-- Android SDK + Java 17
-- Working device/emulator for runtime decode tests
+Done when:
+- Log shows:
+  - SPS count, PPS count
+  - nalLengthSize
+  - video sampleCount
 
-## Setup
+---
 
-```bash
-fvm flutter pub get
-```
+### M2 — Build Access Units from MP4 Samples
+**Goal:** Convert MP4 samples into the same `TimestampedAccessUnit` format used by your player.
 
-## Run
+Features:
+- [ ] Read each sample bytes from `mdat` using computed offsets
+- [ ] Split into NAL units using AVCC length prefix
+- [ ] AU building:
+  - [ ] Include SPS/PPS at start (and before IDR if needed)
+  - [ ] `hasIdr = true` when `nal_unit_type == 5`
+  - [ ] PTS from `stts` + timescale conversion to ms
+- [ ] Sort AUs by PTS
+- [ ] Feed into existing `queue` and `clock`
 
-```bash
-fvm flutter run
-```
+Done when:
+- queue builds with consistent PTS
+- first AU contains SPS/PPS + IDR (or at least SPS/PPS delivered before first IDR)
 
-## Build
+---
 
-```bash
-fvm flutter build apk --debug
-```
+### M3 — Render Correct Grayscale (Decoder Sanity)
+**Goal:** Confirm decoder correctness without chroma complexity.
 
-APK output:
+Features:
+- [ ] Decode IDR-only frames (skip others)
+- [ ] Optional: force chroma neutral for debugging
+  - U/V = 128 so you see stable grayscale
+- [ ] Verify luma stats:
+  - avgY should not be locked near 128
+  - min/max should show contrast
 
-- `build/app/outputs/flutter-apk/app-debug.apk`
+Done when:
+- a recognizable picture appears (even grayscale)
+- no repeated `coeff_token no match ... bits=0000...` spam
 
-## Test Stream
+---
 
-Default stream used in docs and app:
+### M4 — Fix Decoder Alignment (If Any Corruption)
+**Goal:** Eliminate bitstream desync.
 
-- `https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`
+Features:
+- [ ] Ensure slice header fully consumed:
+  - pic_order_cnt_lsb for POC type 0
+  - deblocking filter params when present
+  - slice_qp_delta (SE)
+  - dec_ref_pic_marking for IDR
+- [ ] Ensure macroblock syntax consumption:
+  - transform_size_8x8_flag if PPS transform8x8 is enabled
+  - intra_chroma_pred_mode (UE) for intra MBs
+  - consume Intra8x8 pred bits even if unsupported
+- [ ] Implement `more_rbsp_data()` and stop parsing at rbsp trailing bits
 
-## Troubleshooting
+Done when:
+- mb types stay sane
+- decoding does not drift into long zeros
+- image no longer mosaics
 
-If you see `:h264` Gradle/plugin problems:
+---
 
-1. Verify `dependency_overrides` for `h264` is still present in `pubspec.yaml`.
-2. Run:
-   - `fvm flutter clean`
-   - `fvm flutter pub get`
-3. Confirm `.flutter-plugins-dependencies` points `h264` to `third_party/h264_0_3_0`.
+### M5 — Chroma Correctness (B1.4.4)
+**Goal:** Make color correct.
 
-If runtime decode fails (`MediaCodec BAD_VALUE`, etc.):
+Features:
+- [ ] chroma intra prediction (DC / H / V; plane optional)
+- [ ] chroma nC neighbor tracking
+- [ ] chroma DC 2x2 inverse transform + scaling
+- [ ] proper chroma residual add + clamp
 
-- Check app log lines:
-  - `SPS width=... height=...`
-  - `decode request ...x...`
-- Check Android logcat entries from `h264Reader` and `MediaCodec`.
-- Try a baseline H.264 TS stream without DRM/fMP4.
-# Dart-Native-Video-Player
+Done when:
+- colors are stable and natural
+
+---
+
+### M6 — MP4 Playback Polish
+**Goal:** Smooth playback loop.
+
+Features:
+- [ ] buffering queue limit
+- [ ] optional decoding isolate to avoid UI jank
+- [ ] better scheduling from PTS
+
+Done when:
+- stable FPS and smooth playback
+
+---
+
+### M7 — Return to HLS/TS
+**Goal:** Use the validated decoder with TS pipeline.
+
+Features:
+- [ ] feed TS-built AUs into the same decode/render loop
+- [ ] compare MP4 output vs HLS output to identify TS issues
+- [ ] fix AU boundaries and PTS mapping only (decoder stays same)
+
+Done when:
+- HLS matches MP4 output
+
+---
+
+## Debug Checklist
+
+When picture is wrong:
+- [ ] Confirm PPS `entropyCodingModeFlag == false` (CABAC would break CAVLC decoder)
+- [ ] Log avgY/min/max:
+  - avg near 128 + min/max tight => residual missing
+  - random mosaic => bitstream desync (missing slice/MB fields)
+- [ ] If coeff_token shows bits=0000... => decoding into trailing bits or misaligned syntax
+
+---
+
+## Current Status
+- [ ] M0
+- [ ] M1
+- [ ] M2
+- [ ] M3
+- [ ] M4
+- [ ] M5
+- [ ] M6
+- [ ] M7
+
+---
+
+## Next Task (Recommended)
+Start **M1**: implement minimal MP4 demux for `avc1 + avcC`, then build AU queue from samples.

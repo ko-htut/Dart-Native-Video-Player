@@ -1,4 +1,7 @@
 import 'dart:typed_data';
+import 'decoder/bitreader.dart';
+import 'decoder/exp_golomb.dart';
+import 'decoder/rbsp.dart';
 
 int nalType(Uint8List nal) => nal.isEmpty ? -1 : (nal[0] & 0x1F);
 
@@ -58,18 +61,32 @@ List<AccessUnit> buildIdrAccessUnits(List<Uint8List> nals) {
       final au = <Uint8List>[];
       if (lastSps != null) au.add(lastSps);
       if (lastPps != null) au.add(lastPps);
+      bool sawIdrSlice = false;
 
-      // include the IDR slice + possible additional slices/SEI until next AUD or next IDR
+      // Include IDR slices for one picture.
+      // Stop on next AUD, non-IDR VCL, or next IDR that starts a new picture.
       while (i < nals.length) {
         final tt = nalType(nals[i]);
-        if (i != 0 && (tt == 9 || tt == 5) && au.length > 0 && (tt == 9)) {
-          // AUD indicates next access unit boundary
+        if (tt == 9 && sawIdrSlice) {
+          // AUD => next AU.
           break;
         }
+        if (tt >= 1 && tt <= 5 && tt != 5 && sawIdrSlice) {
+          // Non-IDR VCL => next picture.
+          break;
+        }
+
+        if (tt == 5 && sawIdrSlice) {
+          final firstMb = _tryReadFirstMbInSlice(nals[i]);
+          if (firstMb == 0) {
+            // New primary coded picture starts here.
+            break;
+          }
+        }
+
         au.add(nals[i]);
+        if (tt == 5) sawIdrSlice = true;
         i++;
-        // stop if next is AUD (9)
-        if (i < nals.length && nalType(nals[i]) == 9) break;
       }
 
       aus.add(AccessUnit(au, isIdr: true));
@@ -80,4 +97,16 @@ List<AccessUnit> buildIdrAccessUnits(List<Uint8List> nals) {
   }
 
   return aus;
+}
+
+int? _tryReadFirstMbInSlice(Uint8List nal) {
+  try {
+    if (nal.isEmpty) return null;
+    if ((nal[0] & 0x1F) != 5) return null;
+    final rbsp = ebspToRbsp(nal.sublist(1));
+    final br = BitReader(rbsp);
+    return readUE(br);
+  } catch (_) {
+    return null;
+  }
 }

@@ -8,11 +8,10 @@ class PesParsed {
 
 /// Parse PES packet (starting at 0x000001) and return payload + PTS (if any).
 PesParsed? parsePes(Uint8List pes) {
-  if (pes.length < 14) return null;
+  if (pes.length < 9) return null;
   if (!(pes[0] == 0x00 && pes[1] == 0x00 && pes[2] == 0x01)) return null;
 
   // pes[3] stream_id, pes[4..5] length
-  final flags1 = pes[6];
   final flags2 = pes[7];
   final headerDataLen = pes[8];
 
