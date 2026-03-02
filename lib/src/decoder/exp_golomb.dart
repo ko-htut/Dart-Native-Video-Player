@@ -2,7 +2,7 @@ import 'bitreader.dart';
 
 int readUE(BitReader br) {
   int zeros = 0;
-  while (br.readBit() == 0) {
+  while (!br.eof && br.readBit() == 0) {
     zeros++;
     if (zeros > 31) break;
   }
@@ -13,6 +13,6 @@ int readUE(BitReader br) {
 
 int readSE(BitReader br) {
   final ue = readUE(br);
-  final s = ((ue + 1) >> 1) * ((ue & 1) == 1 ? 1 : -1);
-  return s;
+  final v = ((ue + 1) >> 1) * ((ue & 1) == 1 ? 1 : -1);
+  return v;
 }

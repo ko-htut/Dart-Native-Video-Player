@@ -31,7 +31,7 @@ Uint8List yuv420ToRgba(Yuv420Frame f) {
       final uVal = f.u[uvIndex];
       final vVal = f.v[uvIndex];
 
-      // BT.601
+      // BT.601 (limited range)
       final c = yVal - 16;
       final d = uVal - 128;
       final e = vVal - 128;

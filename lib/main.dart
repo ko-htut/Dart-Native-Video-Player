@@ -1,153 +1,142 @@
-import 'dart:io';
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
-import 'package:h264/h264.dart';
-import 'package:path_provider/path_provider.dart';
 
 import 'src/hls.dart';
-import 'src/ts.dart';
-import 'src/h264_nal.dart';
-import 'src/decoder/sps_parser.dart';
-import 'src/thumb.dart';
+import 'src/ts_packets.dart';
+import 'src/ts_psi.dart';
+import 'src/ts_pes.dart';
+import 'src/pes_pts.dart';
+import 'src/access_unit_pts.dart';
+import 'src/player_clock.dart';
+import 'src/yuv.dart';
+import 'src/decoder/h264_baseline_idr_decoder.dart';
+import 'dart:ui' as ui;
+import 'src/yuv.dart';
 
 void main() => runApp(const App());
 
 class App extends StatelessWidget {
   const App({super.key});
-
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       theme: ThemeData(useMaterial3: true),
-      home: const IdrTimelineScreen(),
+      home: const PureDartPlaybackScreen(),
     );
   }
 }
 
-class IdrTimelineScreen extends StatefulWidget {
-  const IdrTimelineScreen({super.key});
-
+class PureDartPlaybackScreen extends StatefulWidget {
+  const PureDartPlaybackScreen({super.key});
   @override
-  State<IdrTimelineScreen> createState() => _IdrTimelineScreenState();
+  State<PureDartPlaybackScreen> createState() => _PureDartPlaybackScreenState();
 }
 
-class _IdrTimelineScreenState extends State<IdrTimelineScreen> {
+class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
   final urlCtrl = TextEditingController(
-    text: 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8',
+    text:
+        'https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_ts/master.m3u8',
+    // text: 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8',
+    // text: 'https://flutter.github.io/assets-for-api-docs/assets/videos/bee.mp4',
+    // text:'https://sfux-ext.sfux.info/hls/chapter/105/1588724110/1588724110.m3u8',
   );
 
   bool loading = false;
   String log = '';
 
-  final List<IdrThumb> _thumbs = [];
-  IdrThumb? _selected;
+  // Playback
+  final clock = PlayerClock();
+  List<TimestampedAccessUnit> queue = [];
+  TimestampedAccessUnit? current;
 
-  // Cached parameter sets (SPS/PPS) across segments
-  Uint8List? _cachedSps;
-  Uint8List? _cachedPps;
-  SpsInfo? _cachedSpsInfo;
+  final decoder = H264IdrDecoderB11();
+  ui.Image? currentImage;
+  String decodeInfo = '';
+  bool _decoding = false;
 
   void append(String s) => setState(() => log = '$log$s\n');
 
-  // ---------------------------
-  // Helpers
-  // ---------------------------
+  @override
+  void initState() {
+    super.initState();
 
-  String _fmtTime(double sec) {
-    final s = sec.floor();
+    clock.onFrameDue = (t) async {
+      bool changed = false;
+      while (queue.isNotEmpty && queue.first.ptsMs <= t) {
+        current = queue.removeAt(0);
+        changed = true;
+      }
+      if (!changed || current == null) {
+        setState(() {});
+        return;
+      }
+
+      if (_decoding) return; // prevent overlap
+      _decoding = true;
+
+      try {
+        final au = current!;
+        final frame = decoder.decodeIdrAccessUnit(au.nals);
+        if (frame == null) {
+          setState(() {
+            decodeInfo = 'Decode null (maybe CABAC stream or missing SPS/PPS)';
+          });
+          return;
+        }
+        final rgba = yuv420ToRgba(frame);
+        final img = await _rgbaToImage(rgba, frame.width, frame.height);
+        setState(() {
+          currentImage = img;
+          decodeInfo =
+              'B1.1: IDR I16x16+CAVLC (grayscale), ${frame.width}x${frame.height}';
+        });
+      } finally {
+        _decoding = false;
+      }
+    };
+  }
+
+  @override
+  void dispose() {
+    urlCtrl.dispose();
+    clock.dispose();
+    super.dispose();
+  }
+
+  String _fmtMs(int ms) {
+    final s = (ms / 1000).floor();
     final m = s ~/ 60;
     final r = s % 60;
     return '${m.toString().padLeft(2, '0')}:${r.toString().padLeft(2, '0')}';
   }
 
-  void _updateParamSetCacheFromNals(List<Uint8List> nals) {
-    for (final nal in nals) {
-      if (nal.isEmpty) continue;
-      final t = nal[0] & 0x1F;
-      if (t == 7) {
-        _cachedSps = nal;
-        _cachedSpsInfo = parseSps(nal);
-      } else if (t == 8) {
-        _cachedPps = nal;
-      }
-    }
+  Future<ui.Image> rgbaToImage(Uint8List rgba, int w, int h) {
+    final c = Completer<ui.Image>();
+    ui.decodeImageFromPixels(
+      rgba,
+      w,
+      h,
+      ui.PixelFormat.rgba8888,
+      (img) => c.complete(img),
+    );
+    return c.future;
   }
 
-  List<Uint8List> _ensureAuHasSpsPps(List<Uint8List> auNals) {
-    bool hasSps = false;
-    bool hasPps = false;
-
-    for (final nal in auNals) {
-      if (nal.isEmpty) continue;
-      final t = nal[0] & 0x1F;
-      if (t == 7) hasSps = true;
-      if (t == 8) hasPps = true;
-    }
-
-    final out = <Uint8List>[];
-    if (!hasSps && _cachedSps != null) out.add(_cachedSps!);
-    if (!hasPps && _cachedPps != null) out.add(_cachedPps!);
-    out.addAll(auNals);
-    return out;
-  }
-
-  SpsInfo? _findSpsInfo(List<Uint8List> auNals) {
-    for (final nal in auNals) {
-      if (nal.isEmpty) continue;
-      final t = nal[0] & 0x1F;
-      if (t == 7) return parseSps(nal);
-    }
-    return null;
-  }
-
-  Future<File> _decodeIdrAuToPng({
-    required List<Uint8List> auNals,
-    required int width,
-    required int height,
-    required int index,
-  }) async {
-    final dir = await getTemporaryDirectory();
-    final src = File('${dir.path}/au_$index.h264');
-    final dst = File('${dir.path}/au_$index.png');
-
-    final b = BytesBuilder(copy: false);
-    for (final nal in auNals) {
-      b.add(const [0, 0, 0, 1]);
-      b.add(nal);
-    }
-    await src.writeAsBytes(b.toBytes(), flush: true);
-
-    await H264.decodeFrame(src.path, dst.path, width, height);
-    return dst;
-  }
-
-  Future<void> _selectThumb(IdrThumb t) async {
-    setState(() => _selected = t);
-  }
-
-  // ---------------------------
-  // ✅ Milestone A + Timeline
-  // ---------------------------
-
-  Future<void> runMilestoneA() async {
+  Future<void> buildQueue() async {
     setState(() {
       loading = true;
       log = '';
-      _thumbs.clear();
-      _selected = null;
-      _cachedSps = null;
-      _cachedPps = null;
-      _cachedSpsInfo = null;
+      queue = [];
+      current = null;
     });
-
-    const int maxThumbs = 20;
-    const int maxSegmentsToScan = 50;
 
     try {
       final url = Uri.parse(urlCtrl.text.trim());
       append('Load: $url');
 
+      // 1) Resolve playlist
       final kind = await detectPlaylistKind(url);
       HlsMediaPlaylist media;
 
@@ -156,59 +145,43 @@ class _IdrTimelineScreenState extends State<IdrTimelineScreen> {
         append('Master playlist. Variants=${vars.length}');
         if (vars.isEmpty) throw Exception('No variants found.');
 
+        // pick first variant
         append(
-          'Pick variant: res=${vars.first.resolution ?? "?"} bw=${vars.first.bandwidth ?? 0}',
+          'Pick variant: ${vars.first.resolution ?? "?"} bw=${vars.first.bandwidth ?? 0}',
         );
         media = await fetchMediaPlaylist(vars.first.uri);
       } else {
         media = await fetchMediaPlaylist(url);
       }
 
-      append(
-        'Media: segments=${media.segments.length} target=${media.targetDuration}s seq=${media.mediaSequence}',
-      );
+      append('Media segments=${media.segments.length}');
       if (media.segments.isEmpty) return;
 
-      final segLimit = media.segments.length < maxSegmentsToScan
+      // 2) Download & parse first N segments to build a queue
+      //    (increase later when you add buffering + continuous download)
+      const int maxSegments = 10;
+      final int segLimit = media.segments.length < maxSegments
           ? media.segments.length
-          : maxSegmentsToScan;
+          : maxSegments;
 
-      // Track approximate segment time offsets using EXTINF
-      double timeOffset = 0.0;
-
-      // Optional duplicate avoidance
-      final seenIdrSignatures = <int>{};
+      final out = <TimestampedAccessUnit>[];
+      int? basePts90k; // for ms normalization
 
       for (int s = 0; s < segLimit; s++) {
-        if (_thumbs.length >= maxThumbs) break;
-
         final seg = media.segments[s];
-        final segStart = timeOffset;
-        timeOffset += seg.duration;
-
         append(
-          '\n[SEG $s/$segLimit] seq=${seg.sequence} t=${_fmtTime(segStart)} dur=${seg.duration.toStringAsFixed(2)}',
+          '\nSEG $s seq=${seg.sequence} dur=${seg.duration.toStringAsFixed(2)}',
         );
-        Uint8List tsBytes;
-        try {
-          tsBytes = await fetchBytes(seg.uri);
-        } catch (e) {
-          append('  download failed: $e');
-          continue;
-        }
+        final tsBytes = await fetchBytes(seg.uri);
 
         final packets = parseTsPackets(tsBytes).toList();
-        if (packets.isEmpty) {
-          append('  TS parse: 0 packets');
-          continue;
-        }
 
+        // PAT/PMT → find video PID
         final pat = TsPat.find(packets);
         if (pat == null || pat.programs.isEmpty) {
           append('  PAT missing');
           continue;
         }
-
         final pmtPid = pat.programs.values.first;
         final pmt = TsPmt.find(packets, pmtPid);
         if (pmt == null) {
@@ -216,100 +189,54 @@ class _IdrTimelineScreenState extends State<IdrTimelineScreen> {
           continue;
         }
 
-        final videoStreams = pmt.streams
-            .where((x) => x.streamType == 0x1B)
-            .toList();
-        if (videoStreams.isEmpty) {
-          append('  no H.264 stream in PMT');
+        final videoStream = pmt.streams.firstWhere(
+          (x) => x.streamType == 0x1B, // H.264
+          orElse: () => const TsStreamInfo(pid: -1, streamType: -1),
+        );
+        if (videoStream.pid == -1) {
+          append('  No H.264 in PMT');
           continue;
         }
-        final videoPid = videoStreams.first.pid;
+        final videoPid = videoStream.pid;
 
-        final es = extractElementaryStream(packets, videoPid);
-        if (es.isEmpty) {
-          append('  ES empty');
-          continue;
-        }
+        // 3) Reassemble PES for video PID
+        final pesPackets = assemblePesPackets(packets, videoPid).toList();
+        append('  PES packets=${pesPackets.length}');
 
-        final nals = splitAnnexBNals(es);
-        if (nals.isEmpty) {
-          append('  NALs: 0');
-          continue;
-        }
-
-        _updateParamSetCacheFromNals(nals);
-        if (_cachedSpsInfo != null) {
-          append(
-            '  cached SPS: ${_cachedSpsInfo!.width}x${_cachedSpsInfo!.height} pps=${_cachedPps != null}',
+        // 4) Parse PES: extract PTS + payload bytes, accumulate ES and map pts to AU boundaries
+        final ptsChunks = <PtsChunk>[];
+        for (final pes in pesPackets) {
+          final parsed = parsePes(pes);
+          if (parsed == null) continue;
+          if (parsed.pts90k != null) {
+            basePts90k ??= parsed.pts90k;
+          }
+          ptsChunks.add(
+            PtsChunk(pts90k: parsed.pts90k, payload: parsed.esPayload),
           );
-        } else {
-          append('  cached SPS: none');
         }
 
-        final idrAus = buildIdrAccessUnits(nals);
-        append('  IDR AUs: ${idrAus.length}');
+        // 5) Build timestamped Access Units from chunks
+        final aus = buildTimestampedIdrAusFromPtsChunks(
+          ptsChunks: ptsChunks,
+          basePts90k: basePts90k,
+        );
 
-        for (int i = 0; i < idrAus.length; i++) {
-          if (_thumbs.length >= maxThumbs) break;
-
-          final au = idrAus[i];
-          final fixedAuNals = _ensureAuHasSpsPps(au.nals);
-          final spsInfo = _findSpsInfo(fixedAuNals) ?? _cachedSpsInfo;
-
-          if (spsInfo == null) {
-            append('    AU#$i: no SPS available, skip');
-            continue;
-          }
-
-          // Duplicate check (signature from first IDR NAL)
-          final idrNal = fixedAuNals.firstWhere(
-            (n) => n.isNotEmpty && ((n[0] & 0x1F) == 5),
-            orElse: () => Uint8List(0),
-          );
-          if (idrNal.isNotEmpty) {
-            int sig = idrNal.length;
-            for (int k = 0; k < 12 && k < idrNal.length; k++) {
-              sig = (sig * 31) ^ idrNal[k];
-            }
-            if (seenIdrSignatures.contains(sig)) {
-              append('    AU#$i: duplicate IDR, skip');
-              continue;
-            }
-            seenIdrSignatures.add(sig);
-          }
-
-          append('    AU#$i: decode ${spsInfo.width}x${spsInfo.height}');
-          try {
-            final pngFile = await _decodeIdrAuToPng(
-              auNals: fixedAuNals,
-              width: spsInfo.width,
-              height: spsInfo.height,
-              index: _thumbs.length,
-            );
-
-            final thumb = IdrThumb(
-              segmentIndex: s,
-              sequence: seg.sequence,
-              timeSec: segStart,
-              pngPath: pngFile.path,
-            );
-
-            setState(() {
-              _thumbs.add(thumb);
-              _selected ??= thumb;
-            });
-
-            append('    -> OK thumb#${_thumbs.length} @ ${_fmtTime(segStart)}');
-          } catch (e) {
-            append('    -> decode failed: $e');
-          }
-
-          // tiny yield for UI responsiveness
-          await Future<void>.delayed(const Duration(milliseconds: 1));
-        }
+        append('  IDR AUs=${aus.length}');
+        out.addAll(aus);
       }
 
-      append('\nDONE: thumbs=${_thumbs.length}');
+      out.sort((a, b) => a.ptsMs.compareTo(b.ptsMs));
+      queue = out;
+
+      append('\nQueue built: ${queue.length} frames (IDR-only)');
+      if (queue.isNotEmpty) {
+        append(
+          'First PTS=${queue.first.ptsMs}ms Last PTS=${queue.last.ptsMs}ms',
+        );
+      }
+
+      setState(() {});
     } catch (e) {
       append('ERROR: $e');
     } finally {
@@ -317,142 +244,218 @@ class _IdrTimelineScreenState extends State<IdrTimelineScreen> {
     }
   }
 
-  @override
-  void dispose() {
-    urlCtrl.dispose();
-    super.dispose();
+  Future<ui.Image> _rgbaToImage(Uint8List rgba, int w, int h) {
+    final c = Completer<ui.Image>();
+    ui.decodeImageFromPixels(
+      rgba,
+      w,
+      h,
+      ui.PixelFormat.rgba8888,
+      (img) => c.complete(img),
+    );
+    return c.future;
+  }
+
+  void play() {
+    if (queue.isEmpty) return;
+    // Start clock at first frame time (or current)
+    final startMs = current?.ptsMs ?? queue.first.ptsMs;
+    clock.play(fromMs: startMs);
+  }
+
+  void pause() => clock.pause();
+
+  void seekToStart() {
+    if (queue.isEmpty) return;
+    clock.pause();
+    setState(() {
+      current = null;
+    });
+    clock.setTime(queue.first.ptsMs);
   }
 
   @override
   Widget build(BuildContext context) {
-    final selected = _selected;
+    final nowMs = clock.nowMs;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('IDR Timeline (Milestone A)')),
+      appBar: AppBar(
+        title: const Text('Pure Dart Playback (B0: PTS + Scheduler)'),
+      ),
       body: Padding(
         padding: const EdgeInsets.all(12),
-        child: Column(
-          children: [
-            TextField(
-              controller: urlCtrl,
-              decoration: const InputDecoration(
-                labelText: '.m3u8 URL',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                FilledButton(
-                  onPressed: loading ? null : runMilestoneA,
-                  child: Text(loading ? 'Scanning…' : 'Scan & Build Timeline'),
+        child: SingleChildScrollView(
+          child: Column(
+            children: [
+              TextField(
+                controller: urlCtrl,
+                decoration: const InputDecoration(
+                  labelText: '.m3u8 URL',
+                  border: OutlineInputBorder(),
                 ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Text(
-                    'Thumbs: ${_thumbs.length}  '
-                    '${selected == null ? "" : "Selected: ${_fmtTime(selected.timeSec)}"}',
+              ),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  FilledButton(
+                    onPressed: loading ? null : buildQueue,
+                    child: Text(
+                      loading ? 'Building…' : 'Build Queue (10 segments)',
+                    ),
                   ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 10),
-
-            // Main preview
-            Expanded(
-              child: Container(
-                width: double.infinity,
-                decoration: BoxDecoration(
-                  border: Border.all(color: Colors.black12),
-                  borderRadius: BorderRadius.circular(16),
-                ),
-                child: selected == null
-                    ? const Center(child: Text('No preview yet'))
-                    : ClipRRect(
-                        borderRadius: BorderRadius.circular(16),
-                        child: Image.file(
-                          File(selected.pngPath),
-                          fit: BoxFit.contain,
-                        ),
-                      ),
+                  FilledButton.tonal(
+                    onPressed: play,
+                    child: const Text('Play'),
+                  ),
+                  FilledButton.tonal(
+                    onPressed: pause,
+                    child: const Text('Pause'),
+                  ),
+                  FilledButton.tonal(
+                    onPressed: seekToStart,
+                    child: const Text('Seek Start'),
+                  ),
+                ],
               ),
-            ),
+              const SizedBox(height: 10),
 
-            const SizedBox(height: 10),
-
-            // Timeline thumbnails
-            SizedBox(
-              height: 160,
-              child: ListView.separated(
-                scrollDirection: Axis.horizontal,
-                itemCount: _thumbs.length,
-                separatorBuilder: (_, __) => const SizedBox(width: 8),
-                itemBuilder: (ctx, i) {
-                  final t = _thumbs[i];
-                  final isSel = selected?.pngPath == t.pngPath;
-
-                  return GestureDetector(
-                    onTap: () => _selectThumb(t),
-                    child: Container(
-                      width: 160,
-                      padding: const EdgeInsets.all(6),
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(14),
-                        border: Border.all(
-                          color: isSel ? Colors.blue : Colors.black12,
-                          width: 2,
-                        ),
-                      ),
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
+              // “Player view” (placeholder until decoder exists)
+              SizedBox(
+                height: 200,
+                child: AspectRatio(
+                  aspectRatio: 16 / 9,
+                  child: Container(
+                    width: double.infinity,
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(color: Colors.black12),
+                    ),
+                    child: Center(
+                      child: Stack(
                         children: [
-                          ClipRRect(
-                            borderRadius: BorderRadius.circular(10),
-                            child: Image.file(
-                              File(t.pngPath),
-                              width: 148,
-                              height: 96,
-                              fit: BoxFit.cover,
+                          SizedBox(
+                            child: AspectRatio(
+                              aspectRatio: 4 / 3,
+                              child: Center(
+                                child: Stack(
+                                  // crossAxisAlignment:
+                                  //     CrossAxisAlignment.center,
+                                  // mainAxisAlignment:
+                                  //     MainAxisAlignment.center,
+                                  children: [
+                                    Column(
+                                       crossAxisAlignment:
+                                          CrossAxisAlignment.center,
+                                      mainAxisAlignment:
+                                          MainAxisAlignment.center,
+                                      children: [
+                                        Text(
+                                          current == null
+                                              ? 'No frame yet'
+                                              : 'FRAME PTS ${_fmtMs(current!.ptsMs)}\nNALs: ${current!.nals.length}\nHas IDR: ${current!.hasIdr}',
+                                          textAlign: TextAlign.center,
+                                          style: const TextStyle(
+                                            fontFamily: 'monospace',
+                                            fontSize: 14,
+                                          ),
+                                        ),
+                                        Text(
+                                          current == null
+                                              ? 'No frame yet'
+                                              : 'Clock: ${_fmtMs(nowMs)}  (${nowMs}ms)\nFrame due @ ${current!.ptsMs}ms\n$decodeInfo',
+                                          textAlign: TextAlign.center,
+                                        ),
+                                      ],
+                                    ),
+
+                                    currentImage != null
+                                        ? Container(
+                                            decoration: BoxDecoration(
+                                              color: Colors.grey[50],
+                                              borderRadius:
+                                                  BorderRadius.circular(12),
+                                            ),
+                                            child: RawImage(
+                                              image: currentImage,
+                                            ),
+                                          )
+                                        : SizedBox(),
+                                  ],
+
+                                  // : Stack(
+                                  //     // mainAxisSize: MainAxisSize.min,
+                                  //     children: [
+                                  //       Text(
+                                  //         decodeInfo,
+                                  //         style: const TextStyle(
+                                  //           fontFamily: 'monospace',
+                                  //         ),
+                                  //       ),
+                                  //       const SizedBox(height: 7),
+
+                                  //       Container(
+                                  //         decoration: BoxDecoration(
+                                  //           color: Colors.grey[50],
+                                  //           borderRadius:
+                                  //               BorderRadius.circular(12),
+                                  //         ),
+                                  //         child: RawImage(
+                                  //           image: currentImage,
+                                  //         ),
+                                  //       ),
+                                  //     ],
+                                ),
+                              ),
                             ),
                           ),
-                          const SizedBox(height: 6),
-                          Text(
-                            _fmtTime(t.timeSec),
-                            style: const TextStyle(
-                              fontFamily: 'monospace',
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                          Text(
-                            'seg ${t.segmentIndex} / seq ${t.sequence}',
-                            style: const TextStyle(
-                              fontFamily: 'monospace',
-                              fontSize: 11,
-                              color: Colors.black54,
-                            ),
-                            overflow: TextOverflow.ellipsis,
-                          ),
+                          // Column(
+                          //   mainAxisSize: MainAxisSize.min,
+                          //   children: [
+                          //     Text(
+                          //       'Clock: ${_fmtMs(nowMs)}  (${nowMs}ms)',
+                          //       style: const TextStyle(fontFamily: 'monospace'),
+                          //     ),
+                          //     const SizedBox(height: 8),
+                          //     Text(
+                          //       'Queue: ${queue.length}',
+                          //       style: const TextStyle(fontFamily: 'monospace'),
+                          //     ),
+                          //     const SizedBox(height: 16),
+                          //     Text(
+                          //       current == null
+                          //           ? 'No frame yet'
+                          //           : 'FRAME PTS ${_fmtMs(current!.ptsMs)}\nNALs: ${current!.nals.length}\nHas IDR: ${current!.hasIdr}',
+                          //       textAlign: TextAlign.center,
+                          //       style: const TextStyle(
+                          //         fontFamily: 'monospace',
+                          //         fontSize: 14,
+                          //       ),
+                          //     ),
+                          //     const SizedBox(height: 16),
+                          //     const Text(
+                          //       'Next step: decode current.nals (SPS/PPS/IDR/P) into pixels',
+                          //       textAlign: TextAlign.center,
+                          //     ),
+                          //   ],
+                          // ),
                         ],
                       ),
                     ),
-                  );
-                },
+                  ),
+                ),
               ),
-            ),
 
-            const Divider(),
-
-            // Logs
-            SizedBox(
-              height: 140,
-              child: SingleChildScrollView(
+              const Divider(),
+              SingleChildScrollView(
                 child: Text(
-                  log.isEmpty ? 'No logs yet.' : log,
+                  log,
                   style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
                 ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
