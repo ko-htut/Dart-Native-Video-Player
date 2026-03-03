@@ -35,7 +35,7 @@ class PureDartPlaybackScreen extends StatefulWidget {
 
 class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
   final urlCtrl = TextEditingController(
-    // text: 'https://filesamples.com/samples/video/mp4/sample_640x360.mp4',
+    text: 'https://filesamples.com/samples/video/mp4/sample_640x360.mp4',
     // HLS example:
     // text: 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8',
 
