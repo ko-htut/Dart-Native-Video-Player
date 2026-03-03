@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:ndvy_player/pure_frame_view.dart';
+import 'package:ndvy_player/src/mp4/mp4_demux.dart';
+
 import 'src/hls.dart';
 import 'src/ts_packets.dart';
 import 'src/ts_psi.dart';
@@ -33,17 +35,19 @@ class PureDartPlaybackScreen extends StatefulWidget {
 
 class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
   final urlCtrl = TextEditingController(
-    text: 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8',
-    // text: 'https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_ts/master.m3u8',
     // text: 'https://filesamples.com/samples/video/mp4/sample_640x360.mp4',
+    // HLS example:
+    // text: 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8',
+
+    // text: 'https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_ts/master.m3u8',
     // text: 'https://flutter.github.io/assets-for-api-docs/assets/videos/bee.mp4',
     // text:'https://sfux-ext.sfux.info/hls/chapter/105/1588724110/1588724110.m3u8',
+  
   );
 
   bool loading = false;
   String log = '';
 
-  // Playback
   final clock = PlayerClock();
   List<TimestampedAccessUnit> queue = [];
   TimestampedAccessUnit? current;
@@ -73,7 +77,6 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         changed = true;
       }
       if (!changed || current == null) {
-        // Keep UI clock responsive without rebuilding at 60fps.
         if (t - _lastUiUpdateMs >= 100 && mounted) {
           _lastUiUpdateMs = t;
           setState(() {});
@@ -81,12 +84,13 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         return;
       }
 
-      if (_decoding) return; // prevent overlap
+      if (_decoding) return;
       _decoding = true;
 
       try {
         final au = current!;
         Yuv420Frame? frame;
+
         try {
           frame = decoder.decodeIdrAccessUnit(au.nals);
         } catch (e, st) {
@@ -103,6 +107,7 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         }
 
         if (frame == null) {
+          if (!mounted) return;
           setState(() {
             decodeInfo = 'Decode null: ${decoder.lastError ?? "unknown"}';
             _currentRgba = null;
@@ -112,13 +117,10 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
           });
           return;
         }
-        final f = frame;
 
-        final rgba = yuv420ToRgba(f);
+        final rgba = yuv420ToRgba(frame);
 
-        // Debug (helps confirm not tiny)
-        debugPrint("Frame: ${f.width}x${f.height} rgba=${rgba.length}");
-
+        debugPrint("Frame: ${frame.width}x${frame.height} rgba=${rgba.length}");
         int sum = 0, mn = 255, mx = 0;
         for (final p in frame.y) {
           sum += p;
@@ -126,18 +128,16 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
           if (p > mx) mx = p;
         }
         debugPrint("Y avg=${sum ~/ frame.y.length} min=$mn max=$mx");
-        
 
-        // ✅ THIS is what PureFrameView needs
+        if (!mounted) return;
         setState(() {
           _currentRgba = rgba;
-          _frameWidth = f.width;
-          _frameHeight = f.height;
-
+          _frameWidth = frame!.width;
+          _frameHeight = frame.height;
           decodeInfo = decoder.lastError == null
-              ? 'Decoded: ${f.width}x${f.height}'
-              : 'Decoded: ${f.width}x${f.height} (${decoder.lastError})';
-          currentImage = null; // not needed anymore
+              ? 'Decoded: ${frame.width}x${frame.height}'
+              : 'Decoded: ${frame.width}x${frame.height} (${decoder.lastError})';
+          currentImage = null;
         });
       } catch (e, st) {
         debugPrint('onFrameDue error: $e\n$st');
@@ -169,18 +169,6 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
     return '${m.toString().padLeft(2, '0')}:${r.toString().padLeft(2, '0')}';
   }
 
-  Future<ui.Image> rgbaToImage(Uint8List rgba, int w, int h) {
-    final c = Completer<ui.Image>();
-    ui.decodeImageFromPixels(
-      rgba,
-      w,
-      h,
-      ui.PixelFormat.rgba8888,
-      (img) => c.complete(img),
-    );
-    return c.future;
-  }
-
   Future<_VariantProbeResult> _probeVariantCompatibility(Uri mediaUri) async {
     try {
       final media = await fetchMediaPlaylist(mediaUri);
@@ -194,7 +182,9 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
       int idrSliceCount = 0;
       bool hasT8x8 = false;
 
-      final probeSegCount = media.segments.length < 2 ? media.segments.length : 2;
+      final probeSegCount = media.segments.length < 2
+          ? media.segments.length
+          : 2;
       for (int i = 0; i < probeSegCount; i++) {
         final tsBytes = await fetchBytes(media.segments[i].uri);
         final packets = parseTsPackets(tsBytes).toList();
@@ -217,10 +207,11 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
           return const _VariantProbeResult(false, 'incompatible: no H.264');
         }
 
-        final pesPackets = assemblePesPackets(packets, videoStream.pid).toList();
-        if (pesPackets.isEmpty) {
-          continue;
-        }
+        final pesPackets = assemblePesPackets(
+          packets,
+          videoStream.pid,
+        ).toList();
+        if (pesPackets.isEmpty) continue;
 
         final es = BytesBuilder(copy: false);
         for (final pes in pesPackets) {
@@ -246,9 +237,9 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
           }
         }
       }
-      if (ppsById.isEmpty) {
+
+      if (ppsById.isEmpty)
         return const _VariantProbeResult(false, 'incompatible: PPS missing');
-      }
 
       final idsToCheck = usedPpsIds.isNotEmpty
           ? usedPpsIds
@@ -273,9 +264,7 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
             'incompatible: slice_groups=${pps.numSliceGroupsMinus1} (ppsId=$ppsId)',
           );
         }
-        if (pps.transform8x8ModeFlag) {
-          hasT8x8 = true;
-        }
+        if (pps.transform8x8ModeFlag) hasT8x8 = true;
 
         final sps = spsById[pps.spsId];
         if (sps != null && !sps.frameMbsOnlyFlag) {
@@ -287,21 +276,16 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
       }
 
       if (idrSliceCount == 0) {
-        if (hasT8x8) {
-          return const _VariantProbeResult(
-            true,
-            'compatible (no IDR in probe, t8x8=true warning)',
-          );
-        }
-        return const _VariantProbeResult(true, 'compatible (no IDR in probe)');
+        return hasT8x8
+            ? const _VariantProbeResult(
+                true,
+                'compatible (no IDR in probe, t8x8=true warning)',
+              )
+            : const _VariantProbeResult(true, 'compatible (no IDR in probe)');
       }
-      if (hasT8x8) {
-        return const _VariantProbeResult(
-          true,
-          'compatible (t8x8=true warning)',
-        );
-      }
-      return const _VariantProbeResult(true, 'compatible');
+      return hasT8x8
+          ? const _VariantProbeResult(true, 'compatible (t8x8=true warning)')
+          : const _VariantProbeResult(true, 'compatible');
     } catch (e) {
       return _VariantProbeResult(false, 'incompatible: probe error ($e)');
     }
@@ -314,9 +298,9 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
       if (t != 1 && t != 5) return null;
       final rbsp = ebspToRbsp(sliceNal.sublist(1));
       final br = BitReader(rbsp);
-      readUE(br); // first_mb_in_slice
-      readUE(br); // slice_type
-      return readUE(br); // pic_parameter_set_id
+      readUE(br);
+      readUE(br);
+      return readUE(br);
     } catch (_) {
       return null;
     }
@@ -336,7 +320,6 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
       final url = Uri.parse(urlCtrl.text.trim());
       append('Load: $url');
 
-      // 1) Resolve playlist
       final kind = await detectPlaylistKind(url);
       HlsMediaPlaylist media;
 
@@ -345,7 +328,6 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         append('Master playlist. Variants=${vars.length}');
         if (vars.isEmpty) throw Exception('No variants found.');
 
-        // Probe candidates and pick first decoder-compatible variant.
         final baselineVars = vars
             .where((v) => (v.codecs ?? '').toLowerCase().contains('avc1.42'))
             .toList();
@@ -368,9 +350,7 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         }
         if (pick == null) {
           append(
-            'No decoder-compatible variant found.\n'
-            'Need: CAVLC + no slice groups.\n'
-            'Try: https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8',
+            'No decoder-compatible variant found.\nNeed: CAVLC + no slice groups.',
           );
           return;
         }
@@ -383,9 +363,7 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         append('Probe media: ${probe.reason}');
         if (!probe.ok) {
           append(
-            'Media playlist is not decoder-compatible.\n'
-            'Need: CAVLC + no slice groups.\n'
-            'Try: https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8',
+            'Media playlist is not decoder-compatible.\nNeed: CAVLC + no slice groups.',
           );
           return;
         }
@@ -395,15 +373,13 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
       append('Media segments=${media.segments.length}');
       if (media.segments.isEmpty) return;
 
-      // 2) Download & parse first N segments to build a queue
-      //    (increase later when you add buffering + continuous download)
       const int maxSegments = 20;
       final int segLimit = media.segments.length < maxSegments
           ? media.segments.length
           : maxSegments;
 
       final allPtsChunks = <PtsChunk>[];
-      int? basePts90k; // for ms normalization
+      int? basePts90k;
       BytesBuilder? pendingPes;
       int? cachedPmtPid;
       int? cachedVideoPid;
@@ -414,14 +390,11 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
           '\nSEG $s seq=${seg.sequence} dur=${seg.duration.toStringAsFixed(2)}',
         );
         final tsBytes = await fetchBytes(seg.uri);
-
         final packets = parseTsPackets(tsBytes).toList();
 
-        // PAT/PMT → find video PID (with cross-segment cache fallback).
         final pat = TsPat.find(packets);
-        if (pat != null && pat.programs.isNotEmpty) {
+        if (pat != null && pat.programs.isNotEmpty)
           cachedPmtPid = pat.programs.values.first;
-        }
         if (cachedPmtPid == null) {
           append('  PAT missing (no cached PMT PID)');
           continue;
@@ -430,12 +403,10 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         final pmt = TsPmt.find(packets, cachedPmtPid);
         if (pmt != null) {
           final videoStream = pmt.streams.firstWhere(
-            (x) => x.streamType == 0x1B, // H.264
+            (x) => x.streamType == 0x1B,
             orElse: () => const TsStreamInfo(pid: -1, streamType: -1),
           );
-          if (videoStream.pid != -1) {
-            cachedVideoPid = videoStream.pid;
-          }
+          if (videoStream.pid != -1) cachedVideoPid = videoStream.pid;
         }
         if (cachedVideoPid == null) {
           append('  PMT/video PID missing (no cached video PID)');
@@ -443,8 +414,6 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         }
         final videoPid = cachedVideoPid;
 
-        // 3) Reassemble PES continuously across segment boundaries.
-        //    This avoids emitting truncated tail PES from each segment.
         int pesCompleted = 0;
         for (final pkt in packets) {
           if (pkt.pid != videoPid) continue;
@@ -460,9 +429,7 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
             if (pendingPes != null) {
               final parsed = parsePes(pendingPes.toBytes());
               if (parsed != null) {
-                if (parsed.pts90k != null) {
-                  basePts90k ??= parsed.pts90k;
-                }
+                if (parsed.pts90k != null) basePts90k ??= parsed.pts90k;
                 allPtsChunks.add(
                   PtsChunk(pts90k: parsed.pts90k, payload: parsed.esPayload),
                 );
@@ -472,31 +439,21 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
             pendingPes = BytesBuilder(copy: false);
             pendingPes.add(pkt.payload);
           } else {
-            if (pendingPes == null) {
-              // No active PES yet; ignore stray continuation payload.
-              continue;
-            }
+            if (pendingPes == null) continue;
             pendingPes.add(pkt.payload);
           }
         }
-
         append('  PES completed=$pesCompleted');
       }
 
-      // Drop tail in-progress PES (likely incomplete at segment cut).
-      if (pendingPes != null) {
-        append('Drop tail in-progress PES at end of queue build.');
-      }
-
-      // 4) Build timestamped Access Units from all complete PES chunks.
       final out = buildTimestampedIdrAusFromPtsChunks(
         ptsChunks: allPtsChunks,
         basePts90k: basePts90k,
       );
-      append('IDR AUs=${out.length}');
 
       out.sort((a, b) => a.ptsMs.compareTo(b.ptsMs));
       queue = _ensureAuHasCachedParamSets(out);
+
       _nextAuIndex = 0;
       _lastUiUpdateMs = 0;
 
@@ -553,6 +510,73 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
     return out;
   }
 
+  Future<void> buildQueueFromMp4(Uri mp4Url) async {
+    setState(() {
+      loading = true;
+      log = '';
+      queue = [];
+      current = null;
+      _nextAuIndex = 0;
+      _lastUiUpdateMs = 0;
+    });
+
+    try {
+      append("Load MP4: $mp4Url");
+      final bytes = await fetchBytes(mp4Url);
+
+      final track = Mp4Demux.parseH264Track(bytes);
+      append("MP4 timescale=${track.timescale}");
+      append(
+        "avcC nalLen=${track.avc.nalLengthSize} SPS=${track.avc.sps.length} PPS=${track.avc.pps.length}",
+      );
+      append("samples=${track.sampleSizes.length}");
+
+      final out = <TimestampedAccessUnit>[];
+
+      for (int i = 0; i < track.sampleSizes.length; i++) {
+        final sampleNals = Mp4Demux.readSampleNalUnits(bytes, track, i);
+
+        bool hasIdr = false;
+        for (final n in sampleNals) {
+          final nalType = n.isEmpty ? 0 : (n[0] & 0x1F);
+          if (nalType == 5) {
+            hasIdr = true;
+            break;
+          }
+        }
+
+        final nals = <Uint8List>[
+          ...track.avc.sps,
+          ...track.avc.pps,
+          ...sampleNals,
+        ];
+
+        final dts = track.dts[i];
+        final ptsMs = (dts * 1000 ~/ track.timescale);
+
+        out.add(
+          TimestampedAccessUnit(ptsMs: ptsMs, nals: nals, hasIdr: hasIdr),
+        );
+      }
+
+      out.sort((a, b) => a.ptsMs.compareTo(b.ptsMs));
+      queue = out;
+
+      append("MP4 Queue built: ${queue.length} samples");
+      if (queue.isNotEmpty) {
+        append(
+          "First PTS=${queue.first.ptsMs}ms Last PTS=${queue.last.ptsMs}ms",
+        );
+      }
+
+      setState(() {});
+    } catch (e) {
+      append("MP4 ERROR: $e");
+    } finally {
+      setState(() => loading = false);
+    }
+  }
+
   void play() {
     if (queue.isEmpty) return;
     if (_nextAuIndex >= queue.length) _nextAuIndex = 0;
@@ -575,10 +599,11 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final url = urlCtrl.text.trim().toLowerCase();
+    final isMp4 = url.endsWith('.mp4');
+
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Pure Dart Playback (B0: PTS + Scheduler)'),
-      ),
+      appBar: AppBar(title: const Text('Pure Dart Playback')),
       body: Padding(
         padding: const EdgeInsets.all(12),
         child: SingleChildScrollView(
@@ -587,7 +612,7 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
               TextField(
                 controller: urlCtrl,
                 decoration: const InputDecoration(
-                  labelText: '.m3u8 URL',
+                  labelText: '.m3u8 or .mp4 URL',
                   border: OutlineInputBorder(),
                 ),
               ),
@@ -598,9 +623,14 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
                 children: [
                   FilledButton(
                     onPressed: loading ? null : buildQueue,
-                    child: Text(
-                      loading ? 'Building…' : 'Build Queue (20 segments)',
-                    ),
+                    child: Text(loading ? 'Building…' : 'Build Queue (HLS/TS)'),
+                  ),
+                  FilledButton(
+                    onPressed: loading
+                        ? null
+                        : () =>
+                              buildQueueFromMp4(Uri.parse(urlCtrl.text.trim())),
+                    child: const Text('Build Queue (MP4)'),
                   ),
                   FilledButton.tonal(
                     onPressed: play,
@@ -614,13 +644,27 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
                     onPressed: seekToStart,
                     child: const Text('Seek Start'),
                   ),
+                  if (isMp4)
+                    const Padding(
+                      padding: EdgeInsets.only(left: 8),
+                      child: Text(
+                        'Mode: MP4',
+                        style: TextStyle(fontFamily: 'monospace'),
+                      ),
+                    )
+                  else
+                    const Padding(
+                      padding: EdgeInsets.only(left: 8),
+                      child: Text(
+                        'Mode: HLS',
+                        style: TextStyle(fontFamily: 'monospace'),
+                      ),
+                    ),
                 ],
               ),
               const SizedBox(height: 10),
-
-              // “Player view” (placeholder until decoder exists)
-             SizedBox(
-                height: 200,
+              SizedBox(
+                height: 220,
                 width: double.infinity,
                 child: Container(
                   decoration: BoxDecoration(
@@ -648,8 +692,6 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
                                 height: _frameHeight,
                               ),
                       ),
-
-                      // overlay text
                       Positioned(
                         left: 10,
                         bottom: 10,
@@ -670,11 +712,9 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
                 ),
               ),
               const Divider(),
-              SingleChildScrollView(
-                child: Text(
-                  log,
-                  style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-                ),
+              Text(
+                log,
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
               ),
             ],
           ),
