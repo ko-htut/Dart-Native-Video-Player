@@ -26,15 +26,17 @@ VlcNode buildVlcTree(Map<String, int> table) {
 
 int readVlc(BitReader br, VlcNode root, {int maxBits = 32}) {
   var n = root;
+  var code = '';
   for (int i = 0; i < maxBits; i++) {
     if (br.eof) {
-      throw StateError('VLC unexpected EOF');
+      throw StateError('VLC unexpected EOF at code=$code');
     }
     final b = br.readBit();
+    code += b == 0 ? '0' : '1';
     n = (b == 0)
-        ? (n.zero ?? (throw StateError('VLC dead end')))
-        : (n.one ?? (throw StateError('VLC dead end')));
+        ? (n.zero ?? (throw StateError('VLC dead end at code=$code')))
+        : (n.one ?? (throw StateError('VLC dead end at code=$code')));
     if (n.value != null) return n.value!;
   }
-  throw StateError('VLC too long');
+  throw StateError('VLC too long at code=$code');
 }

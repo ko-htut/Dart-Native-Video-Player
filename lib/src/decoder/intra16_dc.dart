@@ -58,8 +58,9 @@ List<int> scaleIntra16LumaDc(List<int> invDc) {
   final out = List<int>.filled(16, 0);
   for (int i = 0; i < 16; i++) {
     final v = i < invDc.length ? invDc[i] : 0;
-    // Intra16 DC normalization stage (integer, rounded).
-    out[i] = _roundShiftSigned(v, 2);
+    // H.264 spec 8.5.10.1: after the inverse 4x4 WHT, divide by 2 (shift 1),
+    // not 4. Shift by 2 caused Intra16x16 DC values to be half as bright.
+    out[i] = _roundShiftSigned(v, 1);
   }
   return out;
 }

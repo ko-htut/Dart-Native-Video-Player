@@ -5,11 +5,11 @@
 // totalZeros4x4[totalCoeff] => {bitString -> totalZeros}
 // totalZerosChromaDC[totalCoeff] => {bitString -> totalZeros}
 
-String _bits(int code, int size) =>
-    code.toRadixString(2).padLeft(size, '0');
+String _bits(int code, int size) => code.toRadixString(2).padLeft(size, '0');
 
 final Map<int, Map<String, int>> totalZeros4x4 = _buildTotalZeros4x4();
-final Map<int, Map<String, int>> totalZerosChromaDC = _buildTotalZerosChromaDc();
+final Map<int, Map<String, int>> totalZerosChromaDC =
+    _buildTotalZerosChromaDc();
 
 Map<int, Map<String, int>> _buildTotalZeros4x4() {
   const totalZerosLen = <List<int>>[

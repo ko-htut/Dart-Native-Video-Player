@@ -43,8 +43,7 @@ class Mp4Demux {
     for (final t in traks) {
       final stsd = _findBoxDeep(fileBytes, t.dataStart, t.end, 'stsd');
       if (stsd == null) continue;
-      if (_findBox(fileBytes, stsd.dataStart + 8, stsd.end, 'avc1') != null ||
-          _findBoxDeep(fileBytes, stsd.dataStart, stsd.end, 'avc1') != null) {
+      if (_stsdHasH264SampleEntry(fileBytes, stsd)) {
         videoTrak = t;
         break;
       }
@@ -62,12 +61,7 @@ class Mp4Demux {
     final timescale = _parseMdhdTimescale(fileBytes, mdhd);
 
     // avcC (inside avc1 sample entry)
-    final avcC = _findBoxDeep(
-      fileBytes,
-      videoTrak.dataStart,
-      videoTrak.end,
-      'avcC',
-    );
+    final avcC = _findAvcCInTrack(fileBytes, videoTrak);
     if (avcC == null) throw StateError('MP4: avcC not found');
     final avc = _parseAvcC(fileBytes.sublist(avcC.dataStart, avcC.end));
 
@@ -339,12 +333,73 @@ class _Box {
   int get dataStart => start + headerSize;
 }
 
+bool _stsdHasH264SampleEntry(Uint8List bytes, _Box stsd) {
+  final br = _ByteReader(bytes, offset: stsd.dataStart);
+  if (br.offset + 8 > stsd.end) return false;
+
+  br.readU8(); // version
+  br.readU24(); // flags
+  final entryCount = br.readU32();
+
+  for (int i = 0; i < entryCount && br.offset + 8 <= stsd.end; i++) {
+    final entryStart = br.offset;
+    final size = br.readU32();
+    final typ = latin1.decode(br.readBytes(4));
+    if (size < 8) return false;
+    final entryEnd = entryStart + size;
+    if (entryEnd > stsd.end) return false;
+
+    if (typ == 'avc1' || typ == 'avc3') return true;
+    br.offset = entryEnd;
+  }
+  return false;
+}
+
+_Box? _findAvcCInTrack(Uint8List bytes, _Box trak) {
+  final stsd = _findBoxDeep(bytes, trak.dataStart, trak.end, 'stsd');
+  if (stsd == null) return null;
+
+  final br = _ByteReader(bytes, offset: stsd.dataStart);
+  if (br.offset + 8 > stsd.end) return null;
+
+  br.readU8(); // version
+  br.readU24(); // flags
+  final entryCount = br.readU32();
+
+  for (int i = 0; i < entryCount && br.offset + 8 <= stsd.end; i++) {
+    final entryStart = br.offset;
+    final size = br.readU32();
+    final typ = latin1.decode(br.readBytes(4));
+    if (size < 8) return null;
+    final entryEnd = entryStart + size;
+    if (entryEnd > stsd.end) return null;
+
+    if (typ == 'avc1' || typ == 'avc3') {
+      // VisualSampleEntry fixed header is 78 bytes after size+type.
+      int childStart = entryStart + 86;
+      if (childStart > entryEnd) {
+        childStart = entryStart + 8;
+      }
+
+      final avcC =
+          _findBox(bytes, childStart, entryEnd, 'avcC') ??
+          _findBoxDeep(bytes, childStart, entryEnd, 'avcC');
+      if (avcC != null) return avcC;
+    }
+
+    br.offset = entryEnd;
+  }
+
+  // Fallback: search inside stsd payload after fullbox header.
+  return _findBoxDeep(bytes, stsd.dataStart + 8, stsd.end, 'avcC');
+}
+
 _Box? _findBox(Uint8List bytes, int start, int end, String type) {
   final br = _ByteReader(bytes, offset: start);
   while (br.offset + 8 <= end) {
     final boxStart = br.offset;
     int size = br.readU32();
-    final t = ascii.decode(br.readBytes(4));
+    final t = latin1.decode(br.readBytes(4));
     int headerSize = 8;
 
     if (size == 1) {
@@ -353,6 +408,7 @@ _Box? _findBox(Uint8List bytes, int start, int end, String type) {
     } else if (size == 0) {
       size = end - boxStart;
     }
+    if (size < headerSize) break;
 
     final boxEnd = boxStart + size;
     if (boxEnd > end) break;
@@ -369,7 +425,7 @@ List<_Box> _findBoxes(Uint8List bytes, int start, int end, String type) {
   while (br.offset + 8 <= end) {
     final boxStart = br.offset;
     int size = br.readU32();
-    final t = ascii.decode(br.readBytes(4));
+    final t = latin1.decode(br.readBytes(4));
     int headerSize = 8;
 
     if (size == 1) {
@@ -378,6 +434,7 @@ List<_Box> _findBoxes(Uint8List bytes, int start, int end, String type) {
     } else if (size == 0) {
       size = end - boxStart;
     }
+    if (size < headerSize) break;
 
     final boxEnd = boxStart + size;
     if (boxEnd > end) break;

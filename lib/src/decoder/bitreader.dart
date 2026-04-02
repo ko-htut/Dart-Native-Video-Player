@@ -13,6 +13,19 @@ class BitReader {
     return left > 0 ? left : 0;
   }
 
+  void seekBit(int pos) {
+    if (pos < 0) {
+      _bit = 0;
+      return;
+    }
+    final maxBits = data.length * 8;
+    _bit = pos > maxBits ? maxBits : pos;
+  }
+
+  int mark() => _bit;
+
+  void rewind(int bitPos) => seekBit(bitPos);
+
   int readBit() => readBits(1);
 
   int readBits(int n) {
@@ -25,6 +38,26 @@ class BitReader {
       _bit++;
     }
     return v;
+  }
+
+  int peekBits(int n) {
+    if (n <= 0) return 0;
+    final m = mark();
+    final v = readBits(n);
+    rewind(m);
+    return v;
+  }
+
+  String peekBitsStr(int n) {
+    if (n <= 0) return '';
+    final m = mark();
+    final take = n < bitsLeft ? n : bitsLeft;
+    final sb = StringBuffer();
+    for (int i = 0; i < take; i++) {
+      sb.write(readBit() == 1 ? '1' : '0');
+    }
+    rewind(m);
+    return sb.toString();
   }
 
   void byteAlign() {

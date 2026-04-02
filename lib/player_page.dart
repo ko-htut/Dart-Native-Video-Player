@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show rootBundle;
 import 'package:ndvy_player/pure_frame_view.dart';
 import 'package:ndvy_player/src/mp4/mp4_demux.dart';
 
@@ -35,18 +36,18 @@ class PureDartPlaybackScreen extends StatefulWidget {
 
 class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
   final urlCtrl = TextEditingController(
-    text: 'https://filesamples.com/samples/video/mp4/sample_640x360.mp4',
+    // text: 'https://filesamples.com/samples/video/mp4/sample_640x360.mp4',
     // HLS example:
-    // text: 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8',
+    text: 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8',
 
     // text: 'https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_ts/master.m3u8',
     // text: 'https://flutter.github.io/assets-for-api-docs/assets/videos/bee.mp4',
     // text:'https://sfux-ext.sfux.info/hls/chapter/105/1588724110/1588724110.m3u8',
-  
   );
 
   bool loading = false;
   String log = '';
+  bool _idrOnly = true; // Step 2 default
 
   final clock = PlayerClock();
   List<TimestampedAccessUnit> queue = [];
@@ -89,6 +90,7 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
 
       try {
         final au = current!;
+        if (_idrOnly && !au.hasIdr) return;
         Yuv420Frame? frame;
 
         try {
@@ -167,6 +169,11 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
     final m = s ~/ 60;
     final r = s % 60;
     return '${m.toString().padLeft(2, '0')}:${r.toString().padLeft(2, '0')}';
+  }
+
+  Future<Uint8List> loadAssetBytes(String path) async {
+    final bd = await rootBundle.load(path);
+    return bd.buffer.asUint8List();
   }
 
   Future<_VariantProbeResult> _probeVariantCompatibility(Uri mediaUri) async {
@@ -522,7 +529,24 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
 
     try {
       append("Load MP4: $mp4Url");
-      final bytes = await fetchBytes(mp4Url);
+      Uint8List bytes;
+      try {
+        final assetBytes = await loadAssetBytes('assets/baby.mp4');
+        if (assetBytes.length > 32) {
+          bytes = assetBytes;
+          append("Using MP4 asset: assets/baby.mp4 bytes=${bytes.length}");
+        } else {
+          append(
+            "Asset assets/baby.mp4 is empty/invalid (bytes=${assetBytes.length}), fallback to URL",
+          );
+          bytes = await fetchBytes(mp4Url);
+          append("Loaded MP4 from URL bytes=${bytes.length}");
+        }
+      } catch (e) {
+        append("Asset load failed ($e), fallback to URL");
+        bytes = await fetchBytes(mp4Url);
+        append("Loaded MP4 from URL bytes=${bytes.length}");
+      }
 
       final track = Mp4Demux.parseH264Track(bytes);
       append("MP4 timescale=${track.timescale}");
@@ -531,7 +555,31 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
       );
       append("samples=${track.sampleSizes.length}");
 
+      if (track.avc.sps.isNotEmpty) {
+        final sps = parseSpsNal(track.avc.sps.first);
+        append(
+          "MP4 SPS: ${sps.width}x${sps.height} profile=${sps.profileIdc} level=${sps.levelIdc}",
+        );
+      } else {
+        append("MP4 WARN: no SPS in avcC");
+      }
+
+      if (track.avc.pps.isNotEmpty) {
+        final pps = parsePpsNal(track.avc.pps.first);
+        append(
+          "MP4 PPS: entropyCodingModeFlag=${pps.entropyCodingModeFlag} t8x8=${pps.transform8x8ModeFlag}",
+        );
+        if (pps.entropyCodingModeFlag) {
+          append("MP4 not supported: CABAC stream (need CAVLC/Baseline)");
+          return;
+        }
+      } else {
+        append("MP4 WARN: no PPS in avcC");
+      }
+
       final out = <TimestampedAccessUnit>[];
+      bool sentParamSets = false;
+      int idrSamples = 0;
 
       for (int i = 0; i < track.sampleSizes.length; i++) {
         final sampleNals = Mp4Demux.readSampleNalUnits(bytes, track, i);
@@ -541,15 +589,18 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
           final nalType = n.isEmpty ? 0 : (n[0] & 0x1F);
           if (nalType == 5) {
             hasIdr = true;
+            idrSamples++;
             break;
           }
         }
 
-        final nals = <Uint8List>[
-          ...track.avc.sps,
-          ...track.avc.pps,
-          ...sampleNals,
-        ];
+        final nals = <Uint8List>[];
+        if (!sentParamSets || hasIdr) {
+          nals.addAll(track.avc.sps);
+          nals.addAll(track.avc.pps);
+          sentParamSets = true;
+        }
+        nals.addAll(sampleNals);
 
         final dts = track.dts[i];
         final ptsMs = (dts * 1000 ~/ track.timescale);
@@ -557,6 +608,18 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         out.add(
           TimestampedAccessUnit(ptsMs: ptsMs, nals: nals, hasIdr: hasIdr),
         );
+      }
+
+      if (_idrOnly) {
+        out.removeWhere((au) => !au.hasIdr);
+      }
+      append("MP4 samples with IDR: $idrSamples/${track.sampleSizes.length}");
+      append("MP4 Queue: ${out.length} AUs (${_idrOnly ? "IDR-only" : "all"})");
+      if (out.isEmpty) {
+        append(
+          "MP4 has no playable AU for current mode. Try disabling IDR only, or use Baseline+CAVLC MP4 with IDR frames.",
+        );
+        return;
       }
 
       out.sort((a, b) => a.ptsMs.compareTo(b.ptsMs));
@@ -585,6 +648,38 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
   }
 
   void pause() => clock.pause();
+
+  void nextIdr() {
+    if (queue.isEmpty) return;
+    for (int i = _nextAuIndex; i < queue.length; i++) {
+      if (!queue[i].hasIdr) continue;
+      clock.setTime(queue[i].ptsMs);
+      setState(() {
+        current = queue[i];
+        _nextAuIndex = i + 1;
+      });
+      return;
+    }
+  }
+
+  void prevIdr() {
+    if (queue.isEmpty) return;
+    final curMs = clock.nowMs;
+    int start = _nextAuIndex - 2;
+    if (start < 0) start = 0;
+    if (start >= queue.length) start = queue.length - 1;
+
+    for (int i = start; i >= 0; i--) {
+      if (queue[i].hasIdr && queue[i].ptsMs < curMs) {
+        clock.setTime(queue[i].ptsMs);
+        setState(() {
+          current = queue[i];
+          _nextAuIndex = i + 1;
+        });
+        return;
+      }
+    }
+  }
 
   void seekToStart() {
     if (queue.isEmpty) return;
@@ -643,6 +738,24 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
                   FilledButton.tonal(
                     onPressed: seekToStart,
                     child: const Text('Seek Start'),
+                  ),
+                  FilledButton.tonal(
+                    onPressed: prevIdr,
+                    child: const Text('Prev IDR'),
+                  ),
+                  FilledButton.tonal(
+                    onPressed: nextIdr,
+                    child: const Text('Next IDR'),
+                  ),
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Text('IDR only'),
+                      Switch(
+                        value: _idrOnly,
+                        onChanged: (v) => setState(() => _idrOnly = v),
+                      ),
+                    ],
                   ),
                   if (isMp4)
                     const Padding(

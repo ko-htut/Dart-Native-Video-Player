@@ -43,13 +43,37 @@ void predictIntra16({
     final dc = (sum + 16) >> 5;
     for (int k = 0; k < 256; k++) out16[k] = dc;
   } else {
-    int sumTop = 0, sumLeft = 0;
-    for (int i = 0; i < 16; i++) {
-      sumTop += top[i];
-      sumLeft += left[i];
+    // Plane mode (H.264 spec §8.3.3.4)
+    // Requires topLeft corner pixel for H/V gradient anchors.
+    int topLeft = 128;
+    if (x0 > 0 && y0 > 0) {
+      topLeft = yPlane[(y0 - 1) * width + (x0 - 1)];
     }
-    final base = (sumTop + sumLeft + 16) >> 5;
-    for (int k = 0; k < 256; k++) out16[k] = base;
+
+    // H = sum(i=1..7) i*(top[7+i] - top[7-i]) + 8*(top[15] - topLeft)
+    int H = 0;
+    for (int i = 1; i <= 7; i++) {
+      H += i * (top[7 + i] - top[7 - i]);
+    }
+    H += 8 * (top[15] - topLeft);
+
+    // V = sum(i=1..7) i*(left[7+i] - left[7-i]) + 8*(left[15] - topLeft)
+    int V = 0;
+    for (int i = 1; i <= 7; i++) {
+      V += i * (left[7 + i] - left[7 - i]);
+    }
+    V += 8 * (left[15] - topLeft);
+
+    final a = 16 * (top[15] + left[15]);
+    final b = (5 * H + 32) >> 6;
+    final c = (5 * V + 32) >> 6;
+
+    for (int y = 0; y < 16; y++) {
+      for (int x = 0; x < 16; x++) {
+        final val = (a + b * (x - 7) + c * (y - 7) + 16) >> 5;
+        out16[y * 16 + x] = clip8(val);
+      }
+    }
   }
 }
 
@@ -127,6 +151,7 @@ void predictIntra4x4({
   if (mode == 4) {
     // Diagonal Down-Right
     // uses left + top + topLeft
+    // H.264 spec 8.3.1.2.4: p[x,y] interpolated along the down-right diagonal.
     int X = topLeft;
     int A0 = T(0), A1 = T(1), A2 = T(2), A3 = T(3);
     int I0 = left[0], I1 = left[1], I2 = left[2], I3 = left[3];
@@ -134,7 +159,7 @@ void predictIntra4x4({
     out[0] = (X + 2 * A0 + A1 + 2) >> 2;
     out[1] = (A0 + 2 * A1 + A2 + 2) >> 2;
     out[2] = (A1 + 2 * A2 + A3 + 2) >> 2;
-    out[3] = (A2 + 2 * A3 + A3 + 2) >> 2;
+    out[3] = (A2 + 2 * A3 + T(4) + 2) >> 2; // fix: was A3 twice; must use T(4)
 
     out[4] = (I0 + 2 * X + A0 + 2) >> 2;
     out[5] = (X + 2 * A0 + A1 + 2) >> 2;
@@ -213,11 +238,18 @@ void predictIntra4x4({
   }
 
   if (mode == 7) {
-    // Vertical-Left
+    // Vertical-Left (H.264 spec 8.3.1.2.7)
+    // Even rows: half-pel  (T(k) + T(k+1) + 1) >> 1
+    // Odd rows:  quarter-pel (T(k) + 2*T(k+1) + T(k+2) + 2) >> 2
     for (int y = 0; y < 4; y++) {
       for (int x = 0; x < 4; x++) {
         final k = x + (y >> 1);
-        final v = ((T(k) + T(k + 1) + 1) >> 1);
+        final int v;
+        if ((y & 1) == 0) {
+          v = (T(k) + T(k + 1) + 1) >> 1;
+        } else {
+          v = (T(k) + 2 * T(k + 1) + T(k + 2) + 2) >> 2;
+        }
         out[y * 4 + x] = v;
       }
     }
@@ -225,13 +257,21 @@ void predictIntra4x4({
   }
 
   if (mode == 8) {
-    // Horizontal-Up
+    // Horizontal-Up (H.264 spec 8.3.1.2.8)
+    // Even columns: half-pel  (ext[k] + ext[k+1] + 1) >> 1
+    // Odd columns:  quarter-pel (ext[k] + 2*ext[k+1] + ext[k+2] + 2) >> 2
     final I0 = left[0], I1 = left[1], I2 = left[2], I3 = left[3];
     final ext = [I0, I1, I2, I3, I3, I3, I3, I3];
     for (int y = 0; y < 4; y++) {
       for (int x = 0; x < 4; x++) {
         final k = y + (x >> 1);
-        out[y * 4 + x] = (ext[k] + ext[k + 1] + 1) >> 1;
+        final int v;
+        if ((x & 1) == 0) {
+          v = (ext[k] + ext[k + 1] + 1) >> 1;
+        } else {
+          v = (ext[k] + 2 * ext[k + 1] + ext[k + 2] + 2) >> 2;
+        }
+        out[y * 4 + x] = v;
       }
     }
     return;

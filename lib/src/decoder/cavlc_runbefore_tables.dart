@@ -12,7 +12,7 @@ const List<List<int>> _runLen = <List<int>>[
   <int>[2, 2, 2, 3, 3], // zerosLeft=4
   <int>[2, 2, 3, 3, 3, 3], // zerosLeft=5
   <int>[2, 3, 3, 3, 3, 3, 3], // zerosLeft=6
-  // zerosLeft >= 7 use the same VLC table:
+  // zerosLeft >= 7 use the extended VLC table:
   <int>[3, 3, 3, 3, 3, 3, 3, 4, 5, 6, 7, 8, 9, 10, 11], // runBefore=0..14
 ];
 
