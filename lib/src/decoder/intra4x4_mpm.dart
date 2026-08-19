@@ -4,9 +4,9 @@ int mostProbableIntra4x4Mode({
   required int leftMode,
   required int topMode,
 }) {
-  if (!leftAvail && !topAvail) return 2; // DC default
-  if (!leftAvail) return topMode;
-  if (!topAvail) return leftMode;
+  // H.264 8.3.1.1: if either neighbouring sample location is unavailable,
+  // or its macroblock is not eligible for Intra4x4 prediction, use DC.
+  if (!leftAvail || !topAvail) return 2;
   return leftMode < topMode ? leftMode : topMode; // min(left, top)
 }
 

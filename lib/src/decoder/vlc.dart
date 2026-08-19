@@ -7,36 +7,94 @@ class VlcNode {
 }
 
 VlcNode buildVlcTree(Map<String, int> table) {
+  if (table.isEmpty) {
+    throw ArgumentError.value(table, 'table', 'must not be empty');
+  }
+
   final root = VlcNode();
-  table.forEach((code, val) {
-    var n = root;
-    for (final ch in code.split('')) {
-      if (ch == '0') {
-        n.zero ??= VlcNode();
-        n = n.zero!;
+  for (final entry in table.entries) {
+    final code = entry.key;
+    if (code.isEmpty) {
+      throw ArgumentError.value(code, 'table code', 'must not be empty');
+    }
+
+    var node = root;
+    for (var index = 0; index < code.length; index++) {
+      if (node.value != null) {
+        throw ArgumentError(
+          'VLC table is not prefix-free: an existing code prefixes "$code"',
+        );
+      }
+
+      final bit = code.codeUnitAt(index);
+      if (bit == 0x30) {
+        node.zero ??= VlcNode();
+        node = node.zero!;
+      } else if (bit == 0x31) {
+        node.one ??= VlcNode();
+        node = node.one!;
       } else {
-        n.one ??= VlcNode();
-        n = n.one!;
+        throw ArgumentError.value(
+          code,
+          'table code',
+          'may contain only 0 and 1',
+        );
       }
     }
-    n.value = val;
-  });
+
+    if (node.value != null) {
+      throw ArgumentError('duplicate VLC code "$code"');
+    }
+    if (node.zero != null || node.one != null) {
+      throw ArgumentError(
+        'VLC table is not prefix-free: "$code" prefixes another code',
+      );
+    }
+    node.value = entry.value;
+  }
   return root;
 }
 
-int readVlc(BitReader br, VlcNode root, {int maxBits = 32}) {
-  var n = root;
-  var code = '';
-  for (int i = 0; i < maxBits; i++) {
-    if (br.eof) {
-      throw StateError('VLC unexpected EOF at code=$code');
-    }
-    final b = br.readBit();
-    code += b == 0 ? '0' : '1';
-    n = (b == 0)
-        ? (n.zero ?? (throw StateError('VLC dead end at code=$code')))
-        : (n.one ?? (throw StateError('VLC dead end at code=$code')));
-    if (n.value != null) return n.value!;
+/// Reads one value from a prefix-free VLC tree.
+///
+/// Failures are intentionally not transactional. A dead-end or truncated VLC
+/// means the enclosing syntax structure is corrupt and its caller must abort.
+int readVlc(BitReader reader, VlcNode root, {int maxBits = 32}) {
+  if (maxBits <= 0) {
+    throw RangeError.range(maxBits, 1, null, 'maxBits');
   }
-  throw StateError('VLC too long at code=$code');
+
+  var node = root;
+  final code = StringBuffer();
+  final startBit = reader.bitPos;
+
+  for (var length = 1; length <= maxBits; length++) {
+    if (reader.eof) {
+      throw BitstreamFormatException(
+        'truncated VLC starting at bit $startBit after "${code.toString()}"',
+        reader.bitPos,
+      );
+    }
+
+    final bit = reader.readBit();
+    code.write(bit);
+    final next = bit == 0 ? node.zero : node.one;
+    if (next == null) {
+      throw BitstreamFormatException(
+        'invalid VLC starting at bit $startBit: no code has prefix '
+        '"${code.toString()}"',
+        reader.bitPos,
+      );
+    }
+    node = next;
+
+    final value = node.value;
+    if (value != null) return value;
+  }
+
+  throw BitstreamFormatException(
+    'VLC starting at bit $startBit exceeds $maxBits bits '
+    '(prefix "${code.toString()}")',
+    reader.bitPos,
+  );
 }

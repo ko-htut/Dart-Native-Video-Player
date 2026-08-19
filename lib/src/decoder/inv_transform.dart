@@ -1,4 +1,6 @@
-const List<List<int>> _dequantCoef4x4 = <List<int>>[
+/// H.264 4x4 inverse-quantisation normalisation adjustments for a flat scaling
+/// list. Entries are `(even,even)`, mixed parity, and `(odd,odd)` respectively.
+const List<List<int>> _dequantByQpMod6 = <List<int>>[
   <int>[10, 13, 16],
   <int>[11, 14, 18],
   <int>[13, 16, 20],
@@ -7,70 +9,74 @@ const List<List<int>> _dequantCoef4x4 = <List<int>>[
   <int>[18, 23, 29],
 ];
 
-int _dequantScaleAt(int x, int y, int qpMod6) {
-  if ((x & 1) == 0 && (y & 1) == 0) return _dequantCoef4x4[qpMod6][0];
-  if ((x & 1) == 1 && (y & 1) == 1) return _dequantCoef4x4[qpMod6][2];
-  return _dequantCoef4x4[qpMod6][1];
+int _clampQp(int qp) => qp.clamp(0, 51).toInt();
+
+int _dequantMultiplier(int row, int column, int qpMod6) {
+  if (row.isEven && column.isEven) {
+    return _dequantByQpMod6[qpMod6][0];
+  }
+  if (row.isOdd && column.isOdd) {
+    return _dequantByQpMod6[qpMod6][2];
+  }
+  return _dequantByQpMod6[qpMod6][1];
 }
 
-int _roundShiftSigned(int v, int shift) {
-  if (shift <= 0) return v;
-  final add = 1 << (shift - 1);
-  if (v >= 0) return (v + add) >> shift;
-  return -(((-v) + add) >> shift);
-}
-
-List<int> invTransform4x4(List<int> c, {int qp = 26}) {
-  int q = qp;
-  if (q < 0) q = 0;
-  if (q > 51) q = 51;
-
+/// Inverse-quantises and inverse-transforms one H.264 4x4 residual block.
+///
+/// This is the Baseline-profile, 8-bit, flat-scaling-list path. Set
+/// [dcAlreadyScaled] for Intra_16x16 luma blocks and 4:2:0 chroma blocks after
+/// their separate DC transform/scaling process; H.264 requires d[0][0] to be
+/// copied directly in those cases.
+List<int> invTransform4x4(
+  List<int> coefficients, {
+  int qp = 26,
+  bool dcAlreadyScaled = false,
+}) {
+  final q = _clampQp(qp);
   final qpDiv6 = q ~/ 6;
   final qpMod6 = q % 6;
+  final dequantized = List<int>.filled(16, 0);
 
-  final dq = List<int>.filled(16, 0);
-  for (int y = 0; y < 4; y++) {
-    for (int x = 0; x < 4; x++) {
-      final idx = y * 4 + x;
-      final coef = idx < c.length ? c[idx] : 0;
-      final s = _dequantScaleAt(x, y, qpMod6);
-      final scaled = coef * s;
-      // Inverse quant approx:
-      // d = (coef * levelScale * 2^(qp/6)) / 16
-      // Use rounded right shift when qpDiv6 < 4.
-      if (qpDiv6 >= 4) {
-        dq[idx] = scaled << (qpDiv6 - 4);
+  for (var row = 0; row < 4; row++) {
+    for (var column = 0; column < 4; column++) {
+      final index = row * 4 + column;
+      final coefficient = index < coefficients.length ? coefficients[index] : 0;
+      if (index == 0 && dcAlreadyScaled) {
+        dequantized[index] = coefficient;
       } else {
-        dq[idx] = _roundShiftSigned(scaled, 4 - qpDiv6);
+        dequantized[index] =
+            coefficient *
+            _dequantMultiplier(row, column, qpMod6) *
+            (1 << qpDiv6);
       }
     }
   }
 
-  final t = List<int>.filled(16, 0);
+  final horizontal = List<int>.filled(16, 0);
+  for (var row = 0; row < 4; row++) {
+    final offset = row * 4;
+    final e0 = dequantized[offset] + dequantized[offset + 2];
+    final e1 = dequantized[offset] - dequantized[offset + 2];
+    final e2 = (dequantized[offset + 1] >> 1) - dequantized[offset + 3];
+    final e3 = dequantized[offset + 1] + (dequantized[offset + 3] >> 1);
 
-  for (int i = 0; i < 4; i++) {
-    final a0 = dq[i * 4 + 0] + dq[i * 4 + 2];
-    final a1 = dq[i * 4 + 0] - dq[i * 4 + 2];
-    final a2 = (dq[i * 4 + 1] >> 1) - dq[i * 4 + 3];
-    final a3 = dq[i * 4 + 1] + (dq[i * 4 + 3] >> 1);
-
-    t[i * 4 + 0] = a0 + a3;
-    t[i * 4 + 1] = a1 + a2;
-    t[i * 4 + 2] = a1 - a2;
-    t[i * 4 + 3] = a0 - a3;
+    horizontal[offset] = e0 + e3;
+    horizontal[offset + 1] = e1 + e2;
+    horizontal[offset + 2] = e1 - e2;
+    horizontal[offset + 3] = e0 - e3;
   }
 
-  final out = List<int>.filled(16, 0);
-  for (int i = 0; i < 4; i++) {
-    final a0 = t[0 * 4 + i] + t[2 * 4 + i];
-    final a1 = t[0 * 4 + i] - t[2 * 4 + i];
-    final a2 = (t[1 * 4 + i] >> 1) - t[3 * 4 + i];
-    final a3 = t[1 * 4 + i] + (t[3 * 4 + i] >> 1);
+  final residual = List<int>.filled(16, 0);
+  for (var column = 0; column < 4; column++) {
+    final g0 = horizontal[column] + horizontal[8 + column];
+    final g1 = horizontal[column] - horizontal[8 + column];
+    final g2 = (horizontal[4 + column] >> 1) - horizontal[12 + column];
+    final g3 = horizontal[4 + column] + (horizontal[12 + column] >> 1);
 
-    out[0 * 4 + i] = (a0 + a3 + 32) >> 6;
-    out[1 * 4 + i] = (a1 + a2 + 32) >> 6;
-    out[2 * 4 + i] = (a1 - a2 + 32) >> 6;
-    out[3 * 4 + i] = (a0 - a3 + 32) >> 6;
+    residual[column] = (g0 + g3 + 32) >> 6;
+    residual[4 + column] = (g1 + g2 + 32) >> 6;
+    residual[8 + column] = (g1 - g2 + 32) >> 6;
+    residual[12 + column] = (g0 - g3 + 32) >> 6;
   }
-  return out;
+  return residual;
 }

@@ -1,5 +1,25 @@
-int clip8(int v) => v < 0 ? 0 : (v > 255 ? 255 : v);
+int clip8(int value) => value.clamp(0, 255).toInt();
 
+void _fill(List<int> output, int count, int value) {
+  for (var i = 0; i < count; i++) {
+    output[i] = value;
+  }
+}
+
+int _average(List<int> samples, int count, int rounding) {
+  var sum = 0;
+  for (var i = 0; i < count; i++) {
+    sum += samples[i];
+  }
+  return (sum + rounding) ~/ count;
+}
+
+/// Produces an H.264 8-bit Intra_16x16 luma prediction block.
+///
+/// [topAvailable], [leftAvailable], and [topLeftAvailable] may be supplied by
+/// the slice decoder when picture geometry alone is insufficient (for example,
+/// at a slice boundary or with constrained intra prediction). When omitted,
+/// availability is inferred from the macroblock position.
 void predictIntra16({
   required int mode,
   required int mbX,
@@ -7,275 +27,358 @@ void predictIntra16({
   required int width,
   required int height,
   required List<int> yPlane,
-  required List<int> out16, // 256
+  required List<int> out16,
+  bool? topAvailable,
+  bool? leftAvailable,
+  bool? topLeftAvailable,
 }) {
+  if (width <= 0 || height <= 0 || yPlane.length < width * height) {
+    throw ArgumentError('The luma plane dimensions are invalid.');
+  }
+  if (out16.length < 256) {
+    throw ArgumentError.value(out16.length, 'out16.length', 'must be >= 256');
+  }
+
   final x0 = mbX * 16;
   final y0 = mbY * 16;
+  final geometryHasTop = y0 > 0 && x0 >= 0 && x0 + 15 < width;
+  final geometryHasLeft = x0 > 0 && y0 >= 0 && y0 + 15 < height;
+  final hasTop = (topAvailable ?? geometryHasTop) && geometryHasTop;
+  final hasLeft = (leftAvailable ?? geometryHasLeft) && geometryHasLeft;
+  final hasTopLeft =
+      (topLeftAvailable ?? (hasTop && hasLeft)) && hasTop && hasLeft;
 
   final top = List<int>.filled(16, 128);
   final left = List<int>.filled(16, 128);
-
-  if (y0 > 0) {
-    final row = (y0 - 1) * width;
-    for (int i = 0; i < 16; i++) {
-      final xx = x0 + i;
-      if (xx < width) top[i] = yPlane[row + xx];
+  if (hasTop) {
+    final row = (y0 - 1) * width + x0;
+    for (var x = 0; x < 16; x++) {
+      top[x] = yPlane[row + x];
     }
   }
-  if (x0 > 0) {
-    for (int j = 0; j < 16; j++) {
-      final yy = y0 + j;
-      if (yy < height) left[j] = yPlane[yy * width + (x0 - 1)];
+  if (hasLeft) {
+    for (var y = 0; y < 16; y++) {
+      left[y] = yPlane[(y0 + y) * width + x0 - 1];
     }
   }
 
-  if (mode == 0) {
-    for (int j = 0; j < 16; j++) {
-      for (int i = 0; i < 16; i++) out16[j * 16 + i] = top[i];
-    }
-  } else if (mode == 1) {
-    for (int j = 0; j < 16; j++) {
-      for (int i = 0; i < 16; i++) out16[j * 16 + i] = left[j];
-    }
-  } else if (mode == 2) {
-    int sum = 0;
-    for (int i = 0; i < 16; i++) sum += top[i] + left[i];
-    final dc = (sum + 16) >> 5;
-    for (int k = 0; k < 256; k++) out16[k] = dc;
-  } else {
-    // Plane mode (H.264 spec §8.3.3.4)
-    // Requires topLeft corner pixel for H/V gradient anchors.
-    int topLeft = 128;
-    if (x0 > 0 && y0 > 0) {
-      topLeft = yPlane[(y0 - 1) * width + (x0 - 1)];
-    }
-
-    // H = sum(i=1..7) i*(top[7+i] - top[7-i]) + 8*(top[15] - topLeft)
-    int H = 0;
-    for (int i = 1; i <= 7; i++) {
-      H += i * (top[7 + i] - top[7 - i]);
-    }
-    H += 8 * (top[15] - topLeft);
-
-    // V = sum(i=1..7) i*(left[7+i] - left[7-i]) + 8*(left[15] - topLeft)
-    int V = 0;
-    for (int i = 1; i <= 7; i++) {
-      V += i * (left[7 + i] - left[7 - i]);
-    }
-    V += 8 * (left[15] - topLeft);
-
-    final a = 16 * (top[15] + left[15]);
-    final b = (5 * H + 32) >> 6;
-    final c = (5 * V + 32) >> 6;
-
-    for (int y = 0; y < 16; y++) {
-      for (int x = 0; x < 16; x++) {
-        final val = (a + b * (x - 7) + c * (y - 7) + 16) >> 5;
-        out16[y * 16 + x] = clip8(val);
+  void predictDc() {
+    final int dc;
+    if (hasTop && hasLeft) {
+      var sum = 0;
+      for (var i = 0; i < 16; i++) {
+        sum += top[i] + left[i];
       }
+      dc = (sum + 16) >> 5;
+    } else if (hasTop) {
+      dc = _average(top, 16, 8);
+    } else if (hasLeft) {
+      dc = _average(left, 16, 8);
+    } else {
+      dc = 128;
     }
+    _fill(out16, 256, dc);
+  }
+
+  switch (mode) {
+    case 0: // Vertical
+      if (!hasTop) {
+        predictDc();
+        return;
+      }
+      for (var y = 0; y < 16; y++) {
+        for (var x = 0; x < 16; x++) {
+          out16[y * 16 + x] = top[x];
+        }
+      }
+      return;
+    case 1: // Horizontal
+      if (!hasLeft) {
+        predictDc();
+        return;
+      }
+      for (var y = 0; y < 16; y++) {
+        for (var x = 0; x < 16; x++) {
+          out16[y * 16 + x] = left[y];
+        }
+      }
+      return;
+    case 2: // DC
+      predictDc();
+      return;
+    case 3: // Plane
+      if (!hasTop || !hasLeft || !hasTopLeft) {
+        predictDc();
+        return;
+      }
+
+      final topLeft = yPlane[(y0 - 1) * width + x0 - 1];
+      var horizontalGradient = 0;
+      var verticalGradient = 0;
+      for (var i = 1; i <= 7; i++) {
+        horizontalGradient += i * (top[7 + i] - top[7 - i]);
+        verticalGradient += i * (left[7 + i] - left[7 - i]);
+      }
+      horizontalGradient += 8 * (top[15] - topLeft);
+      verticalGradient += 8 * (left[15] - topLeft);
+
+      final a = 16 * (top[15] + left[15]);
+      final b = (5 * horizontalGradient + 32) >> 6;
+      final c = (5 * verticalGradient + 32) >> 6;
+      for (var y = 0; y < 16; y++) {
+        for (var x = 0; x < 16; x++) {
+          out16[y * 16 + x] = clip8((a + b * (x - 7) + c * (y - 7) + 16) >> 5);
+        }
+      }
+      return;
+    default:
+      // Invalid modes cannot occur in a conforming bitstream. DC provides a
+      // deterministic concealment result without reading unavailable samples.
+      predictDc();
   }
 }
 
-/// Intra4x4: mode 0..8
-/// We sample top[0..7], left[0..3], topLeft (X). If top-right unavailable, repeat top[3].
+/// Produces one H.264 8-bit Intra_4x4 luma prediction block.
+///
+/// [top] contains A..H and [left] contains I..L. If the top-right neighbour is
+/// unavailable, E..H are substituted with D as required by H.264 section
+/// 8.3.1.2. Explicit availability is necessary at slice boundaries because a
+/// sample value of 128 is not an availability marker.
 void predictIntra4x4({
   required int mode,
-  required List<int> top, // len 8
-  required List<int> left, // len 4
+  required List<int> top,
+  required List<int> left,
   required int topLeft,
-  required List<int> out, // len 16
+  required List<int> out,
+  bool topAvailable = true,
+  bool leftAvailable = true,
+  bool topLeftAvailable = true,
+  bool topRightAvailable = true,
 }) {
-  // Clamp sample fetches at frame edges (spec-style edge replication).
-  int A(int i) {
-    if (i < 0) return top[0];
-    if (i >= top.length) return top[top.length - 1];
-    return top[i];
+  if (top.length < 4) {
+    throw ArgumentError.value(top.length, 'top.length', 'must be >= 4');
+  }
+  if (left.length < 4) {
+    throw ArgumentError.value(left.length, 'left.length', 'must be >= 4');
+  }
+  if (out.length < 16) {
+    throw ArgumentError.value(out.length, 'out.length', 'must be >= 16');
   }
 
-  int I(int j) {
-    if (j < 0) return left[0];
-    if (j >= left.length) return left[left.length - 1];
-    return left[j];
-  }
-
-  // Fill helper
-  void fill(int v) {
-    for (int k = 0; k < 16; k++) out[k] = v;
-  }
-
-  if (mode == 0) {
-    // Vertical
-    for (int j = 0; j < 4; j++)
-      for (int i = 0; i < 4; i++) out[j * 4 + i] = A(i);
-    return;
-  }
-  if (mode == 1) {
-    // Horizontal
-    for (int j = 0; j < 4; j++)
-      for (int i = 0; i < 4; i++) out[j * 4 + i] = I(j);
-    return;
-  }
-  if (mode == 2) {
-    // DC
-    int sum = 0;
-    for (int i = 0; i < 4; i++) sum += A(i) + I(i);
-    fill((sum + 4) >> 3);
-    return;
-  }
-
-  // For directional modes we need extended top samples (A..H)
-  final t = List<int>.filled(8, 128);
-  for (int i = 0; i < 8; i++) {
-    t[i] = A(i);
-  }
-  int T(int i) {
-    if (i < 0) return t[0];
-    if (i >= t.length) return t[t.length - 1];
-    return t[i];
-  }
-
-  if (mode == 3) {
-    // Diagonal Down-Left
-    // p[x,y] = (A[x+y] + 2*A[x+y+1] + A[x+y+2] + 2)/4
-    for (int y = 0; y < 4; y++) {
-      for (int x = 0; x < 4; x++) {
-        final k = x + y;
-        final v = (T(k) + 2 * T(k + 1) + T(k + 2) + 2) >> 2;
-        out[y * 4 + x] = v;
-      }
+  final topSamples = List<int>.filled(8, 128);
+  if (topAvailable) {
+    for (var i = 0; i < 4; i++) {
+      topSamples[i] = top[i];
     }
-    return;
+    for (var i = 4; i < 8; i++) {
+      topSamples[i] = topRightAvailable && i < top.length
+          ? top[i]
+          : topSamples[3];
+    }
   }
-
-  if (mode == 4) {
-    // Diagonal Down-Right
-    // uses left + top + topLeft
-    // H.264 spec 8.3.1.2.4: p[x,y] interpolated along the down-right diagonal.
-    int X = topLeft;
-    int A0 = T(0), A1 = T(1), A2 = T(2), A3 = T(3);
-    int I0 = left[0], I1 = left[1], I2 = left[2], I3 = left[3];
-
-    out[0] = (X + 2 * A0 + A1 + 2) >> 2;
-    out[1] = (A0 + 2 * A1 + A2 + 2) >> 2;
-    out[2] = (A1 + 2 * A2 + A3 + 2) >> 2;
-    out[3] = (A2 + 2 * A3 + T(4) + 2) >> 2; // fix: was A3 twice; must use T(4)
-
-    out[4] = (I0 + 2 * X + A0 + 2) >> 2;
-    out[5] = (X + 2 * A0 + A1 + 2) >> 2;
-    out[6] = (A0 + 2 * A1 + A2 + 2) >> 2;
-    out[7] = (A1 + 2 * A2 + A3 + 2) >> 2;
-
-    out[8] = (I1 + 2 * I0 + X + 2) >> 2;
-    out[9] = (I0 + 2 * X + A0 + 2) >> 2;
-    out[10] = (X + 2 * A0 + A1 + 2) >> 2;
-    out[11] = (A0 + 2 * A1 + A2 + 2) >> 2;
-
-    out[12] = (I2 + 2 * I1 + I0 + 2) >> 2;
-    out[13] = (I1 + 2 * I0 + X + 2) >> 2;
-    out[14] = (I0 + 2 * X + A0 + 2) >> 2;
-    out[15] = (X + 2 * A0 + A1 + 2) >> 2;
-    return;
+  final leftSamples = List<int>.filled(4, 128);
+  if (leftAvailable) {
+    for (var i = 0; i < 4; i++) {
+      leftSamples[i] = left[i];
+    }
   }
+  final xSample = topLeftAvailable ? topLeft : 128;
 
-  // The remaining 4 modes (5..8) are more complex; implement stable spec-style approximations.
+  int topRef(int index) => index == -1 ? xSample : topSamples[index];
+  int leftRef(int index) => index == -1 ? xSample : leftSamples[index];
+  int half(int a, int b) => (a + b + 1) >> 1;
+  int quarter(int a, int b, int c) => (a + 2 * b + c + 2) >> 2;
 
-  if (mode == 5) {
-    // Vertical-Right
-    // interpolate using top + topLeft + left
-    final X = topLeft;
-    final A0 = T(0), A1 = T(1), A2 = T(2), A3 = T(3);
-    final I0 = left[0], I1 = left[1], I2 = left[2], I3 = left[3];
+  void conceal() => _fill(out, 16, 128);
 
-    out[0] = (X + A0 + 1) >> 1;
-    out[1] = (A0 + A1 + 1) >> 1;
-    out[2] = (A1 + A2 + 1) >> 1;
-    out[3] = (A2 + A3 + 1) >> 1;
-
-    out[4] = (I0 + 2 * X + A0 + 2) >> 2;
-    out[5] = (X + 2 * A0 + A1 + 2) >> 2;
-    out[6] = (A0 + 2 * A1 + A2 + 2) >> 2;
-    out[7] = (A1 + 2 * A2 + A3 + 2) >> 2;
-
-    out[8] = (I1 + I0 + 1) >> 1;
-    out[9] = (I0 + 2 * X + A0 + 2) >> 2;
-    out[10] = (X + 2 * A0 + A1 + 2) >> 2;
-    out[11] = (A0 + 2 * A1 + A2 + 2) >> 2;
-
-    out[12] = (I2 + I1 + 1) >> 1;
-    out[13] = (I1 + I0 + 1) >> 1;
-    out[14] = (I0 + 2 * X + A0 + 2) >> 2;
-    out[15] = (X + 2 * A0 + A1 + 2) >> 2;
-    return;
-  }
-
-  if (mode == 6) {
-    // Horizontal-Down
-    final X = topLeft;
-    final A0 = T(0), A1 = T(1), A2 = T(2), A3 = T(3);
-    final I0 = left[0], I1 = left[1], I2 = left[2], I3 = left[3];
-
-    out[0] = (X + I0 + 1) >> 1;
-    out[4] = (I0 + I1 + 1) >> 1;
-    out[8] = (I1 + I2 + 1) >> 1;
-    out[12] = (I2 + I3 + 1) >> 1;
-
-    out[1] = (A0 + 2 * X + I0 + 2) >> 2;
-    out[5] = (X + 2 * I0 + I1 + 2) >> 2;
-    out[9] = (I0 + 2 * I1 + I2 + 2) >> 2;
-    out[13] = (I1 + 2 * I2 + I3 + 2) >> 2;
-
-    out[2] = (A1 + A0 + 1) >> 1;
-    out[6] = (A0 + 2 * X + I0 + 2) >> 2;
-    out[10] = (X + 2 * I0 + I1 + 2) >> 2;
-    out[14] = (I0 + 2 * I1 + I2 + 2) >> 2;
-
-    out[3] = (A2 + A1 + 1) >> 1;
-    out[7] = (A1 + A0 + 1) >> 1;
-    out[11] = (A0 + 2 * X + I0 + 2) >> 2;
-    out[15] = (X + 2 * I0 + I1 + 2) >> 2;
-    return;
-  }
-
-  if (mode == 7) {
-    // Vertical-Left (H.264 spec 8.3.1.2.7)
-    // Even rows: half-pel  (T(k) + T(k+1) + 1) >> 1
-    // Odd rows:  quarter-pel (T(k) + 2*T(k+1) + T(k+2) + 2) >> 2
-    for (int y = 0; y < 4; y++) {
-      for (int x = 0; x < 4; x++) {
-        final k = x + (y >> 1);
-        final int v;
-        if ((y & 1) == 0) {
-          v = (T(k) + T(k + 1) + 1) >> 1;
-        } else {
-          v = (T(k) + 2 * T(k + 1) + T(k + 2) + 2) >> 2;
+  switch (mode) {
+    case 0: // Vertical
+      if (!topAvailable) {
+        conceal();
+        return;
+      }
+      for (var y = 0; y < 4; y++) {
+        for (var x = 0; x < 4; x++) {
+          out[y * 4 + x] = topSamples[x];
         }
-        out[y * 4 + x] = v;
       }
-    }
-    return;
-  }
-
-  if (mode == 8) {
-    // Horizontal-Up (H.264 spec 8.3.1.2.8)
-    // Even columns: half-pel  (ext[k] + ext[k+1] + 1) >> 1
-    // Odd columns:  quarter-pel (ext[k] + 2*ext[k+1] + ext[k+2] + 2) >> 2
-    final I0 = left[0], I1 = left[1], I2 = left[2], I3 = left[3];
-    final ext = [I0, I1, I2, I3, I3, I3, I3, I3];
-    for (int y = 0; y < 4; y++) {
-      for (int x = 0; x < 4; x++) {
-        final k = y + (x >> 1);
-        final int v;
-        if ((x & 1) == 0) {
-          v = (ext[k] + ext[k + 1] + 1) >> 1;
-        } else {
-          v = (ext[k] + 2 * ext[k + 1] + ext[k + 2] + 2) >> 2;
+      return;
+    case 1: // Horizontal
+      if (!leftAvailable) {
+        conceal();
+        return;
+      }
+      for (var y = 0; y < 4; y++) {
+        for (var x = 0; x < 4; x++) {
+          out[y * 4 + x] = leftSamples[y];
         }
-        out[y * 4 + x] = v;
       }
-    }
-    return;
+      return;
+    case 2: // DC
+      final int dc;
+      if (topAvailable && leftAvailable) {
+        var sum = 0;
+        for (var i = 0; i < 4; i++) {
+          sum += topSamples[i] + leftSamples[i];
+        }
+        dc = (sum + 4) >> 3;
+      } else if (topAvailable) {
+        dc = _average(topSamples, 4, 2);
+      } else if (leftAvailable) {
+        dc = _average(leftSamples, 4, 2);
+      } else {
+        dc = 128;
+      }
+      _fill(out, 16, dc);
+      return;
+    case 3: // Diagonal down-left
+      if (!topAvailable) {
+        conceal();
+        return;
+      }
+      for (var y = 0; y < 4; y++) {
+        for (var x = 0; x < 4; x++) {
+          final offset = x + y;
+          out[y * 4 + x] = quarter(
+            topSamples[offset],
+            topSamples[offset + 1],
+            offset == 6 ? topSamples[7] : topSamples[offset + 2],
+          );
+        }
+      }
+      return;
+    case 4: // Diagonal down-right
+      if (!topAvailable || !leftAvailable || !topLeftAvailable) {
+        conceal();
+        return;
+      }
+      for (var y = 0; y < 4; y++) {
+        for (var x = 0; x < 4; x++) {
+          if (x > y) {
+            final offset = x - y;
+            out[y * 4 + x] = quarter(
+              topRef(offset - 2),
+              topRef(offset - 1),
+              topRef(offset),
+            );
+          } else if (x < y) {
+            final offset = y - x;
+            out[y * 4 + x] = quarter(
+              leftRef(offset - 2),
+              leftRef(offset - 1),
+              leftRef(offset),
+            );
+          } else {
+            out[y * 4 + x] = quarter(topSamples[0], xSample, leftSamples[0]);
+          }
+        }
+      }
+      return;
+    case 5: // Vertical-right
+      if (!topAvailable || !leftAvailable || !topLeftAvailable) {
+        conceal();
+        return;
+      }
+      for (var y = 0; y < 4; y++) {
+        for (var x = 0; x < 4; x++) {
+          final z = 2 * x - y;
+          final int value;
+          if (z >= 0 && z.isEven) {
+            final offset = x - (y >> 1);
+            value = half(topRef(offset - 1), topRef(offset));
+          } else if (z > 0) {
+            final offset = x - (y >> 1);
+            value = quarter(
+              topRef(offset - 2),
+              topRef(offset - 1),
+              topRef(offset),
+            );
+          } else if (z == -1) {
+            value = quarter(leftSamples[0], xSample, topSamples[0]);
+          } else {
+            value = quarter(leftRef(y - 1), leftRef(y - 2), leftRef(y - 3));
+          }
+          out[y * 4 + x] = value;
+        }
+      }
+      return;
+    case 6: // Horizontal-down
+      if (!topAvailable || !leftAvailable || !topLeftAvailable) {
+        conceal();
+        return;
+      }
+      for (var y = 0; y < 4; y++) {
+        for (var x = 0; x < 4; x++) {
+          final z = 2 * y - x;
+          final int value;
+          if (z >= 0 && z.isEven) {
+            final offset = y - (x >> 1);
+            value = half(leftRef(offset - 1), leftRef(offset));
+          } else if (z > 0) {
+            final offset = y - (x >> 1);
+            value = quarter(
+              leftRef(offset - 2),
+              leftRef(offset - 1),
+              leftRef(offset),
+            );
+          } else if (z == -1) {
+            value = quarter(leftSamples[0], xSample, topSamples[0]);
+          } else {
+            value = quarter(topRef(x - 1), topRef(x - 2), topRef(x - 3));
+          }
+          out[y * 4 + x] = value;
+        }
+      }
+      return;
+    case 7: // Vertical-left
+      if (!topAvailable) {
+        conceal();
+        return;
+      }
+      for (var y = 0; y < 4; y++) {
+        for (var x = 0; x < 4; x++) {
+          final offset = x + (y >> 1);
+          out[y * 4 + x] = y.isEven
+              ? half(topSamples[offset], topSamples[offset + 1])
+              : quarter(
+                  topSamples[offset],
+                  topSamples[offset + 1],
+                  topSamples[offset + 2],
+                );
+        }
+      }
+      return;
+    case 8: // Horizontal-up
+      if (!leftAvailable) {
+        conceal();
+        return;
+      }
+      for (var y = 0; y < 4; y++) {
+        for (var x = 0; x < 4; x++) {
+          final z = x + 2 * y;
+          final int value;
+          if (z == 0 || z == 2 || z == 4) {
+            value = half(
+              leftSamples[y + (x >> 1)],
+              leftSamples[y + (x >> 1) + 1],
+            );
+          } else if (z == 1 || z == 3) {
+            final offset = y + (x >> 1);
+            value = quarter(
+              leftSamples[offset],
+              leftSamples[offset + 1],
+              leftSamples[offset + 2],
+            );
+          } else if (z == 5) {
+            value = quarter(leftSamples[2], leftSamples[3], leftSamples[3]);
+          } else {
+            value = leftSamples[3];
+          }
+          out[y * 4 + x] = value;
+        }
+      }
+      return;
+    default:
+      conceal();
   }
-
-  fill(128);
 }

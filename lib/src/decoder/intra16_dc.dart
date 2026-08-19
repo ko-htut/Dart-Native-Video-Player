@@ -1,89 +1,97 @@
-int _roundShiftSigned(int v, int shift) {
-  if (shift <= 0) return v;
-  final add = 1 << (shift - 1);
-  if (v >= 0) return (v + add) >> shift;
-  return -(((-v) + add) >> shift);
+const List<int> _dcDequantByQpMod6 = <int>[10, 11, 13, 14, 16, 18];
+
+int _clampQp(int qp) => qp.clamp(0, 51).toInt();
+
+/// Applies the unnormalised separable 4x4 Hadamard transform used by H.264 for
+/// Intra_16x16 luma DC coefficients.
+List<int> _hadamard4x4(List<int> source) {
+  final input = List<int>.filled(16, 0);
+  for (var i = 0; i < source.length && i < 16; i++) {
+    input[i] = source[i];
+  }
+
+  final horizontal = List<int>.filled(16, 0);
+  for (var row = 0; row < 4; row++) {
+    final offset = row * 4;
+    final a0 = input[offset] + input[offset + 1];
+    final a1 = input[offset] - input[offset + 1];
+    final a2 = input[offset + 2] + input[offset + 3];
+    final a3 = input[offset + 2] - input[offset + 3];
+
+    horizontal[offset] = a0 + a2;
+    horizontal[offset + 1] = a0 - a2;
+    horizontal[offset + 2] = a1 - a3;
+    horizontal[offset + 3] = a1 + a3;
+  }
+
+  final output = List<int>.filled(16, 0);
+  for (var column = 0; column < 4; column++) {
+    final a0 = horizontal[column] + horizontal[4 + column];
+    final a1 = horizontal[column] - horizontal[4 + column];
+    final a2 = horizontal[8 + column] + horizontal[12 + column];
+    final a3 = horizontal[8 + column] - horizontal[12 + column];
+
+    output[column] = a0 + a2;
+    output[4 + column] = a0 - a2;
+    output[8 + column] = a1 - a3;
+    output[12 + column] = a1 + a3;
+  }
+  return output;
 }
 
-List<int> _hadamard4x4Core(List<int> src) {
-  final s = List<int>.filled(16, 0);
-  final n = src.length < 16 ? src.length : 16;
-  for (int i = 0; i < n; i++) {
-    s[i] = src[i];
-  }
+/// Exposes the unnormalised Hadamard operation for encoder/decoder tests.
+List<int> hadamard4x4Forward(List<int> source) => _hadamard4x4(source);
 
-  final t = List<int>.filled(16, 0);
-  for (int r = 0; r < 4; r++) {
-    final x0 = s[r * 4 + 0];
-    final x1 = s[r * 4 + 1];
-    final x2 = s[r * 4 + 2];
-    final x3 = s[r * 4 + 3];
+/// The H.264 inverse luma DC Hadamard has the same integer kernel as forward.
+List<int> hadamard4x4Inverse(List<int> source) => _hadamard4x4(source);
 
-    final a0 = x0 + x1;
-    final a1 = x0 - x1;
-    final a2 = x2 + x3;
-    final a3 = x2 - x3;
+/// Scales inverse-Hadamard Intra_16x16 DC values for the flat Baseline-profile
+/// scaling list.
+List<int> scaleIntra16LumaDc(List<int> inverseDc, {int qp = 26}) {
+  final q = _clampQp(qp);
+  final qpDiv6 = q ~/ 6;
+  // With the Baseline flat scaling list, LevelScale(qp%6, 0, 0) is the
+  // normalisation adjustment multiplied by the list weight 16.
+  final levelScale = _dcDequantByQpMod6[q % 6] << 4;
+  final output = List<int>.filled(16, 0);
 
-    t[r * 4 + 0] = a0 + a2;
-    t[r * 4 + 1] = a1 + a3;
-    t[r * 4 + 2] = a0 - a2;
-    t[r * 4 + 3] = a1 - a3;
-  }
-
-  final out = List<int>.filled(16, 0);
-  for (int c = 0; c < 4; c++) {
-    final x0 = t[0 * 4 + c];
-    final x1 = t[1 * 4 + c];
-    final x2 = t[2 * 4 + c];
-    final x3 = t[3 * 4 + c];
-
-    final a0 = x0 + x1;
-    final a1 = x0 - x1;
-    final a2 = x2 + x3;
-    final a3 = x2 - x3;
-
-    out[0 * 4 + c] = a0 + a2;
-    out[1 * 4 + c] = a1 + a3;
-    out[2 * 4 + c] = a0 - a2;
-    out[3 * 4 + c] = a1 - a3;
-  }
-  return out;
-}
-
-List<int> hadamard4x4Forward(List<int> src) => _hadamard4x4Core(src);
-
-List<int> hadamard4x4Inverse(List<int> src) => _hadamard4x4Core(src);
-
-List<int> scaleIntra16LumaDc(List<int> invDc) {
-  final out = List<int>.filled(16, 0);
-  for (int i = 0; i < 16; i++) {
-    final v = i < invDc.length ? invDc[i] : 0;
-    // H.264 spec 8.5.10.1: after the inverse 4x4 WHT, divide by 2 (shift 1),
-    // not 4. Shift by 2 caused Intra16x16 DC values to be half as bright.
-    out[i] = _roundShiftSigned(v, 1);
-  }
-  return out;
-}
-
-void applyIntra16LumaDcHadamard(List<List<int>> coeffBlocks) {
-  if (coeffBlocks.length < 16) return;
-
-  final dcIn = List<int>.filled(16, 0);
-  for (int i = 0; i < 16; i++) {
-    final block = coeffBlocks[i];
-    if (block.isNotEmpty) {
-      dcIn[i] = block[0];
+  for (var i = 0; i < 16; i++) {
+    final value = i < inverseDc.length ? inverseDc[i] : 0;
+    if (q >= 36) {
+      output[i] = (value * levelScale) << (qpDiv6 - 6);
+    } else {
+      final shift = 6 - qpDiv6;
+      output[i] = (value * levelScale + (1 << (shift - 1))) >> shift;
     }
   }
+  return output;
+}
 
-  final dcInv = hadamard4x4Inverse(dcIn);
-  final dcOut = scaleIntra16LumaDc(dcInv);
+/// Replaces each luma 4x4 block's DC coefficient with its transformed and
+/// already-dequantised Intra_16x16 DC value.
+///
+/// The blocks and the DC input are both in 4x4 raster order. Subsequent calls
+/// to `invTransform4x4` must set `dcAlreadyScaled: true`.
+void applyIntra16LumaDcHadamard(List<List<int>> coeffBlocks, {int qp = 26}) {
+  if (coeffBlocks.length < 16) {
+    throw ArgumentError.value(
+      coeffBlocks.length,
+      'coeffBlocks.length',
+      'must be >= 16',
+    );
+  }
 
-  for (int i = 0; i < 16; i++) {
-    final block = coeffBlocks[i];
-    if (block.isNotEmpty) {
-      // Replace DC as required by Intra16x16 DC reconstruction path.
-      block[0] = dcOut[i];
+  final dcInput = List<int>.filled(16, 0);
+  for (var i = 0; i < 16; i++) {
+    if (coeffBlocks[i].isEmpty) {
+      throw ArgumentError('coeffBlocks[$i] must not be empty.');
     }
+    dcInput[i] = coeffBlocks[i][0];
+  }
+
+  final transformed = hadamard4x4Inverse(dcInput);
+  final scaled = scaleIntra16LumaDc(transformed, qp: qp);
+  for (var i = 0; i < 16; i++) {
+    coeffBlocks[i][0] = scaled[i];
   }
 }

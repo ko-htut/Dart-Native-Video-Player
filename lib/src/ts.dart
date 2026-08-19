@@ -168,13 +168,12 @@ void _appendPesPayload(BytesBuilder out, Uint8List pes) {
   if (pes.length < 9) return;
   if (!(pes[0] == 0x00 && pes[1] == 0x00 && pes[2] == 0x01)) return;
 
-  final flags = pes[7];
   final headerDataLen = pes[8];
 
   // payload starts after 9 + headerDataLen
   final payloadStart = 9 + headerDataLen;
   if (payloadStart >= pes.length) return;
 
-  // NOTE: flags includes PTS/DTS etc; we ignore for now.
+  // NOTE: the PES flags byte (pes[7]) can advertise PTS/DTS; it is ignored.
   out.add(pes.sublist(payloadStart));
 }

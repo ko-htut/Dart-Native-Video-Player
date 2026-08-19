@@ -24,8 +24,9 @@ int _findStartCode(Uint8List b, int from) {
   for (int i = from; i + 3 < b.length; i++) {
     if (b[i] == 0 && b[i + 1] == 0) {
       if (b[i + 2] == 1) return i; // 00 00 01
-      if (i + 4 < b.length && b[i + 2] == 0 && b[i + 3] == 1)
+      if (i + 4 < b.length && b[i + 2] == 0 && b[i + 3] == 1) {
         return i; // 00 00 00 01
+      }
     }
   }
   return -1;

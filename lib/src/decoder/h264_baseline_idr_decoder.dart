@@ -1,1315 +1,1915 @@
-import 'package:flutter/foundation.dart';
+import 'dart:typed_data';
 
 import '../yuv.dart';
 import 'bitreader.dart';
-import 'exp_golomb.dart';
-import 'rbsp.dart';
-import 'sps.dart';
-import 'pps.dart';
-import 'nc_context.dart';
 import 'cavlc.dart';
-import 'inv_transform.dart';
-import 'intra16_dc.dart';
-import 'intra_pred.dart';
-import 'intra4x4_mpm.dart';
 import 'chroma_pred.dart';
+import 'deblocking_filter.dart';
+import 'exp_golomb.dart';
+import 'intra16_dc.dart';
+import 'intra4x4_mpm.dart';
+import 'intra_pred.dart';
+import 'inv_transform.dart';
+import 'motion_compensation.dart';
+import 'pps.dart';
+import 'rbsp.dart';
+import 'reference_picture_list.dart';
+import 'slice_header.dart';
+import 'sps.dart';
 
-const bool _kAlignDebug = true;
-const int _kAlignDebugMaxMb = 256;
-const int _kAlignDebugMaxLines = 4000;
-const bool _kStopOnFirstMbError = false;
-const bool _kStopOnUnsupportedMbType = true;
+/// Optional low-level trace hook used by diagnostics and golden tests.
+void Function(String message)? h264DecoderTrace;
 
-class _MbTrace {
-  final int mbAddr;
-  final int startBit;
-  final Map<String, int> _cp = <String, int>{};
+class H264DecodeStats {
+  final int frameNumber;
+  final H264SliceType sliceType;
+  final int macroblockCount;
+  final int intraMacroblocks;
+  final int interMacroblocks;
+  final int skippedMacroblocks;
+  final int sliceCount;
 
-  _MbTrace(this.mbAddr, this.startBit) {
-    _cp['mb_start'] = startBit;
+  const H264DecodeStats({
+    required this.frameNumber,
+    required this.sliceType,
+    required this.macroblockCount,
+    required this.intraMacroblocks,
+    required this.interMacroblocks,
+    required this.skippedMacroblocks,
+    required this.sliceCount,
+  });
+}
+
+/// Progressive 8-bit 4:2:0 H.264 decoder for Baseline/CAVLC I and P pictures.
+///
+/// Unsupported syntax and malformed variable-length codes fail the access unit
+/// instead of guessing values and desynchronising all following macroblocks.
+class H264BaselineDecoder {
+  static const int defaultMaxCodedDimension = 4096;
+  static const int defaultMaxLumaSamples = 4096 * 2304;
+
+  final bool enableDeblocking;
+  final int maxCodedDimension;
+  final int maxLumaSamples;
+  final Map<int, SpsInfo> _spsById = <int, SpsInfo>{};
+  final Map<int, PpsInfo> _ppsById = <int, PpsInfo>{};
+  final List<_DecodedPicture> _shortTermReferences = <_DecodedPicture>[];
+  int? _previousReferenceFrameNum;
+  int _pictureId = 0;
+
+  String? lastError;
+  H264DecodeStats? lastStats;
+
+  H264BaselineDecoder({
+    this.enableDeblocking = true,
+    this.maxCodedDimension = defaultMaxCodedDimension,
+    this.maxLumaSamples = defaultMaxLumaSamples,
+  }) {
+    if (maxCodedDimension <= 0) {
+      throw ArgumentError.value(
+        maxCodedDimension,
+        'maxCodedDimension',
+        'must be positive',
+      );
+    }
+    if (maxLumaSamples <= 0) {
+      throw ArgumentError.value(
+        maxLumaSamples,
+        'maxLumaSamples',
+        'must be positive',
+      );
+    }
   }
 
-  void hit(String name, int bitPos) {
-    _cp[name] = bitPos;
+  Map<int, SpsInfo> get sequenceParameterSets =>
+      Map<int, SpsInfo>.unmodifiable(_spsById);
+  Map<int, PpsInfo> get pictureParameterSets =>
+      Map<int, PpsInfo>.unmodifiable(_ppsById);
+
+  void reset({bool clearParameterSets = true}) {
+    _shortTermReferences.clear();
+    _previousReferenceFrameNum = null;
+    lastError = null;
+    lastStats = null;
+    if (clearParameterSets) {
+      _spsById.clear();
+      _ppsById.clear();
+    }
   }
 
-  String summary() {
-    final parts = <String>[];
-    _cp.forEach((k, v) => parts.add('$k=$v'));
-    return parts.join(',');
+  Yuv420Frame? decodeAccessUnit(List<Uint8List> nals) {
+    try {
+      final frame = decodeAccessUnitOrThrow(nals);
+      lastError = null;
+      return frame;
+    } catch (error) {
+      lastError = error.toString();
+      return null;
+    }
+  }
+
+  Yuv420Frame decodeAccessUnitOrThrow(List<Uint8List> nals) {
+    final vclNals = <Uint8List>[];
+    for (final nal in nals) {
+      if (nal.isEmpty) continue;
+      if ((nal.first & 0x80) != 0) {
+        throw const FormatException('forbidden_zero_bit is set');
+      }
+      switch (nal.first & 0x1f) {
+        case 1:
+        case 5:
+          vclNals.add(nal);
+          break;
+        case 7:
+          final sps = parseSpsNal(nal);
+          _spsById[sps.spsId] = sps;
+          break;
+        case 8:
+          final provisional = parsePpsNal(nal);
+          final sps = _spsById[provisional.spsId];
+          final pps = sps == null
+              ? provisional
+              : parsePpsNal(nal, chromaFormatIdc: sps.chromaFormatIdc);
+          _ppsById[pps.ppsId] = pps;
+          break;
+        default:
+          break;
+      }
+    }
+    if (vclNals.isEmpty) {
+      throw const FormatException('Access unit contains no VCL slice');
+    }
+
+    final headers = <SliceHeader>[
+      for (final nal in vclNals)
+        parseSliceHeader(nal, ppsById: _ppsById, spsById: _spsById),
+    ];
+    final first = headers.first;
+    _validateSupportedHeader(first);
+    for (final header in headers.skip(1)) {
+      _validateSupportedHeader(header);
+      if (header.frameNum != first.frameNum ||
+          header.sps.spsId != first.sps.spsId ||
+          header.pps.ppsId != first.pps.ppsId ||
+          header.nalUnitType != first.nalUnitType ||
+          header.nalRefIdc != first.nalRefIdc ||
+          header.idrPicId != first.idrPicId ||
+          header.picOrderCntLsb != first.picOrderCntLsb ||
+          header.deltaPicOrderCntBottom != first.deltaPicOrderCntBottom ||
+          header.deltaPicOrderCnt0 != first.deltaPicOrderCnt0 ||
+          header.deltaPicOrderCnt1 != first.deltaPicOrderCnt1 ||
+          header.redundantPicCnt != first.redundantPicCnt) {
+        throw const FormatException(
+          'Access unit contains slices from different pictures',
+        );
+      }
+    }
+
+    if (first.isIdr) {
+      _shortTermReferences.clear();
+      _previousReferenceFrameNum = null;
+    }
+    final pictureUsesInterPrediction = headers.any(
+      (header) => header.sliceType == H264SliceType.p,
+    );
+    if (pictureUsesInterPrediction && _shortTermReferences.isEmpty) {
+      throw StateError('P picture has no decoded reference picture');
+    }
+    for (final reference in _shortTermReferences) {
+      if (reference.buffer.width != first.sps.codedWidth ||
+          reference.buffer.height != first.sps.codedHeight) {
+        throw StateError('Reference-picture dimensions changed without an IDR');
+      }
+    }
+    if (!first.isIdr && (pictureUsesInterPrediction || first.nalRefIdc != 0)) {
+      _validateFrameNumContinuity(first);
+    }
+
+    final state = _FrameState(first.sps);
+    var intraCount = 0;
+    var interCount = 0;
+    var skippedCount = 0;
+    for (var sliceId = 0; sliceId < headers.length; sliceId++) {
+      final header = headers[sliceId];
+      final references = header.sliceType == H264SliceType.p
+          ? _buildReferenceList0(header)
+          : const <_DecodedPicture>[];
+      state.referenceListsBySlice[sliceId] = references;
+      state.sliceParameters[sliceId] = H264DeblockingSliceParameters(
+        disableDeblockingFilterIdc: header.disableDeblockingFilterIdc,
+        sliceAlphaC0OffsetDiv2: header.sliceAlphaC0OffsetDiv2,
+        sliceBetaOffsetDiv2: header.sliceBetaOffsetDiv2,
+      );
+      final result = _decodeSlice(
+        header: header,
+        state: state,
+        references: references,
+        sliceId: sliceId,
+        initialQpY: header.sliceQpY,
+      );
+      intraCount += result.intra;
+      interCount += result.inter;
+      skippedCount += result.skipped;
+    }
+
+    final missing = state.macroblocks.indexWhere((meta) => !meta.decoded);
+    if (missing != -1) {
+      throw FormatException('Picture is missing macroblock $missing');
+    }
+
+    if (enableDeblocking) {
+      H264DeblockingFilter.apply420(
+        luma: state.picture.y,
+        cb: state.picture.u,
+        cr: state.picture.v,
+        codedWidth: first.sps.codedWidth,
+        codedHeight: first.sps.codedHeight,
+        macroblocks: state.buildDeblockingMetadata(),
+        sliceParametersById: state.sliceParameters,
+      );
+    }
+
+    final decoded = _DecodedPicture(
+      pictureId: _pictureId++,
+      frameNum: first.frameNum,
+      buffer: state.picture,
+    );
+    if (first.nalRefIdc != 0) {
+      _markShortTermReference(decoded, first.sps);
+      _previousReferenceFrameNum = first.frameNum;
+    }
+
+    lastStats = H264DecodeStats(
+      frameNumber: first.frameNum,
+      sliceType: first.sliceType,
+      macroblockCount: state.macroblocks.length,
+      intraMacroblocks: intraCount,
+      interMacroblocks: interCount,
+      skippedMacroblocks: skippedCount,
+      sliceCount: headers.length,
+    );
+    return _cropPicture(decoded.buffer, first.sps);
+  }
+
+  Yuv420Frame? decodeIdrAccessUnit(List<Uint8List> nals) =>
+      decodeAccessUnit(nals);
+
+  void _validateSupportedHeader(SliceHeader header) {
+    final sps = header.sps;
+    final pps = header.pps;
+    if (!sps.isSupportedBaseline420) {
+      throw FormatException(
+        'Unsupported SPS: profile=${sps.profileIdc}, '
+        'chroma=${sps.chromaFormatIdc}, bitDepth=${sps.bitDepthLumaMinus8 + 8}, '
+        'frameMbsOnly=${sps.frameMbsOnlyFlag}',
+      );
+    }
+    if (sps.codedWidth > maxCodedDimension ||
+        sps.codedHeight > maxCodedDimension) {
+      throw FormatException(
+        'Coded dimensions ${sps.codedWidth}x${sps.codedHeight} exceed '
+        'the configured limit $maxCodedDimension',
+      );
+    }
+    final lumaSamples = sps.codedWidth * sps.codedHeight;
+    if (lumaSamples > maxLumaSamples) {
+      throw FormatException(
+        'Coded picture has $lumaSamples luma samples; configured limit is '
+        '$maxLumaSamples',
+      );
+    }
+    if (pps.entropyCodingModeFlag) {
+      throw const FormatException('CABAC slices are not supported');
+    }
+    if (header.sliceType == H264SliceType.p && pps.weightedPredFlag) {
+      throw const FormatException('Weighted P prediction is not supported');
+    }
+    if ((header.redundantPicCnt ?? 0) > 0) {
+      throw const FormatException('Redundant pictures are not supported');
+    }
+    if (header.longTermReferenceFlag) {
+      throw const FormatException('Long-term IDR references are not supported');
+    }
+    if (pps.numSliceGroupsMinus1 != 0) {
+      throw const FormatException('FMO/slice groups are not supported');
+    }
+    if (pps.transform8x8ModeFlag || pps.picScalingMatrixPresentFlag) {
+      throw const FormatException(
+        '8x8 transforms/scaling matrices unsupported',
+      );
+    }
+    if (header.sliceType != H264SliceType.i &&
+        header.sliceType != H264SliceType.p) {
+      throw FormatException('Unsupported slice type ${header.sliceType.name}');
+    }
+    if (header.sliceType == H264SliceType.p &&
+        header.numRefIdxL0ActiveMinus1 > 31) {
+      throw FormatException(
+        'num_ref_idx_l0_active_minus1='
+        '${header.numRefIdxL0ActiveMinus1} exceeds 31',
+      );
+    }
+    if (header.adaptiveRefPicMarkingModeFlag) {
+      throw const FormatException('Adaptive reference marking is unsupported');
+    }
+  }
+
+  void _validateFrameNumContinuity(SliceHeader header) {
+    final previous = _previousReferenceFrameNum;
+    if (previous == null) return;
+    final expectedFrameNum = (previous + 1) % header.sps.maxFrameNum;
+    if (header.frameNum != expectedFrameNum) {
+      throw StateError(
+        'Unsupported frame_num gap: expected $expectedFrameNum after '
+        'reference $previous, got ${header.frameNum}',
+      );
+    }
+  }
+
+  List<_DecodedPicture> _buildReferenceList0(SliceHeader header) {
+    return buildPReferenceList0<_DecodedPicture>(
+      shortTermReferences: <H264ShortTermReference<_DecodedPicture>>[
+        for (final reference in _shortTermReferences)
+          H264ShortTermReference<_DecodedPicture>(
+            frameNum: reference.frameNum,
+            value: reference,
+          ),
+      ],
+      currentFrameNum: header.frameNum,
+      maxFrameNum: header.sps.maxFrameNum,
+      activeReferenceCount: header.numRefIdxL0ActiveMinus1 + 1,
+      modifications: header.refPicListModificationsL0,
+    ).map((reference) => reference.value).toList(growable: false);
+  }
+
+  void _markShortTermReference(_DecodedPicture picture, SpsInfo sps) {
+    final capacity = sps.maxNumRefFrames;
+    if (capacity <= 0) {
+      _shortTermReferences.clear();
+      return;
+    }
+    while (_shortTermReferences.length >= capacity) {
+      var oldestIndex = 0;
+      var oldestPicNum = _shortTermPicNum(
+        _shortTermReferences.first.frameNum,
+        picture.frameNum,
+        sps.maxFrameNum,
+      );
+      for (var index = 1; index < _shortTermReferences.length; index++) {
+        final picNum = _shortTermPicNum(
+          _shortTermReferences[index].frameNum,
+          picture.frameNum,
+          sps.maxFrameNum,
+        );
+        if (picNum < oldestPicNum) {
+          oldestIndex = index;
+          oldestPicNum = picNum;
+        }
+      }
+      _shortTermReferences.removeAt(oldestIndex);
+    }
+    _shortTermReferences.add(picture);
   }
 }
 
-class H264IdrDecoder {
-  String? lastError;
-  SpsInfo? _sps;
-  PpsInfo? _pps;
-  final Map<int, SpsInfo> _spsById = <int, SpsInfo>{};
-  final Map<int, PpsInfo> _ppsById = <int, PpsInfo>{};
-  int _alignLogCount = 0;
+class H264IdrDecoder extends H264BaselineDecoder {}
 
-  // Frame-level storage for intra4x4 modes (needed for MPM across MB boundaries)
-  late List<int> _frameIntra4x4Modes; // length = mbCount * 16
+class _DecodedPicture {
+  final int pictureId;
+  final int frameNum;
+  final Yuv420PictureBuffer buffer;
 
-  // H.264 Table 9-4(a) coded_block_pattern mapping for Intra4x4/Intra8x8.
-  static const List<int> _cbpIntraMap = <int>[
-    47,
-    31,
-    15,
-    0,
-    23,
-    27,
+  const _DecodedPicture({
+    required this.pictureId,
+    required this.frameNum,
+    required this.buffer,
+  });
+}
+
+int _shortTermPicNum(int frameNum, int currentFrameNum, int maxFrameNum) =>
+    frameNum > currentFrameNum ? frameNum - maxFrameNum : frameNum;
+
+class _MacroblockMeta {
+  bool decoded = false;
+  bool isIntra = false;
+  int sliceId = -1;
+  int qpY = 26;
+  int qpCb = 26;
+  int qpCr = 26;
+  int lumaDcTotalCoeff = -1;
+  bool usesIntra4x4 = false;
+  final List<int> lumaTotalCoeff = List<int>.filled(16, -1);
+  final List<int> cbTotalCoeff = List<int>.filled(4, -1);
+  final List<int> crTotalCoeff = List<int>.filled(4, -1);
+  final List<bool> lumaReconstructed = List<bool>.filled(16, false);
+  final List<bool> intraModeKnown = List<bool>.filled(16, false);
+}
+
+class _FrameState {
+  final SpsInfo sps;
+  final int mbWidth;
+  final int mbHeight;
+  final Yuv420PictureBuffer picture;
+  final List<_MacroblockMeta> macroblocks;
+  final List<int> intra4x4Modes;
+  final MotionFieldGrid motion;
+  final Map<int, List<_DecodedPicture>> referenceListsBySlice =
+      <int, List<_DecodedPicture>>{};
+  final Map<int, H264DeblockingSliceParameters> sliceParameters =
+      <int, H264DeblockingSliceParameters>{};
+
+  _FrameState(this.sps)
+    : mbWidth = sps.codedWidth >> 4,
+      mbHeight = sps.codedHeight >> 4,
+      picture = Yuv420PictureBuffer(
+        width: sps.codedWidth,
+        height: sps.codedHeight,
+        y: Uint8List(sps.codedWidth * sps.codedHeight),
+        u: Uint8List((sps.codedWidth >> 1) * (sps.codedHeight >> 1)),
+        v: Uint8List((sps.codedWidth >> 1) * (sps.codedHeight >> 1)),
+      ),
+      macroblocks = List<_MacroblockMeta>.generate(
+        (sps.codedWidth >> 4) * (sps.codedHeight >> 4),
+        (_) => _MacroblockMeta(),
+      ),
+      intra4x4Modes = List<int>.filled(
+        (sps.codedWidth >> 4) * (sps.codedHeight >> 4) * 16,
+        2,
+      ),
+      motion = MotionFieldGrid.forLumaSize(
+        width: sps.codedWidth,
+        height: sps.codedHeight,
+      ) {
+    picture.y.fillRange(0, picture.y.length, 128);
+    picture.u.fillRange(0, picture.u.length, 128);
+    picture.v.fillRange(0, picture.v.length, 128);
+  }
+
+  _MacroblockMeta metaAt(int mbX, int mbY) => macroblocks[mbY * mbWidth + mbX];
+
+  bool macroblockAvailable(
+    int mbX,
+    int mbY, {
+    required int sliceId,
+    required bool constrainedIntra,
+  }) {
+    if (mbX < 0 || mbY < 0 || mbX >= mbWidth || mbY >= mbHeight) {
+      return false;
+    }
+    final meta = metaAt(mbX, mbY);
+    return meta.decoded &&
+        meta.sliceId == sliceId &&
+        (!constrainedIntra || meta.isIntra);
+  }
+
+  bool lumaBlockAvailable(
+    int globalBlockX,
+    int globalBlockY, {
+    required int currentMbAddr,
+    required int sliceId,
+    required bool constrainedIntra,
+  }) {
+    if (globalBlockX < 0 ||
+        globalBlockY < 0 ||
+        globalBlockX >= mbWidth * 4 ||
+        globalBlockY >= mbHeight * 4) {
+      return false;
+    }
+    final mbX = globalBlockX >> 2;
+    final mbY = globalBlockY >> 2;
+    final mbAddr = mbY * mbWidth + mbX;
+    final meta = macroblocks[mbAddr];
+    if (meta.sliceId != sliceId || (constrainedIntra && !meta.isIntra)) {
+      return false;
+    }
+    final raster = (globalBlockY & 3) * 4 + (globalBlockX & 3);
+    return mbAddr == currentMbAddr
+        ? meta.lumaReconstructed[raster]
+        : meta.decoded;
+  }
+
+  List<H264DeblockingMacroblock> buildDeblockingMetadata() =>
+      <H264DeblockingMacroblock>[
+        for (var mbAddr = 0; mbAddr < macroblocks.length; mbAddr++)
+          _buildDeblockingMacroblock(mbAddr),
+      ];
+
+  H264DeblockingMacroblock _buildDeblockingMacroblock(int mbAddr) {
+    final meta = macroblocks[mbAddr];
+    final references = referenceListsBySlice[meta.sliceId];
+    final mbX = mbAddr % mbWidth;
+    final mbY = mbAddr ~/ mbWidth;
+    final blocks = <H264DeblockingBlock>[];
+    for (var raster = 0; raster < 16; raster++) {
+      final bx = raster & 3;
+      final by = raster >> 2;
+      final entry = motion.entryAt4x4(mbX * 4 + bx, mbY * 4 + by);
+      blocks.add(
+        H264DeblockingBlock(
+          totalCoeff: _nonNegative(meta.lumaTotalCoeff[raster]),
+          referenceIndexL0: entry.referenceIndex,
+          referencePictureId:
+              entry.referenceIndex >= 0 &&
+                  references != null &&
+                  entry.referenceIndex < references.length
+              ? references[entry.referenceIndex].pictureId
+              : null,
+          motionVectorL0: H264MotionVector(entry.vector.x, entry.vector.y),
+        ),
+      );
+    }
+    return H264DeblockingMacroblock(
+      isIntra: meta.isIntra,
+      qpY: meta.qpY,
+      qpCb: meta.qpCb,
+      qpCr: meta.qpCr,
+      lumaBlocks: blocks,
+      cbTotalCoeff: <int>[
+        for (final value in meta.cbTotalCoeff) _nonNegative(value),
+      ],
+      crTotalCoeff: <int>[
+        for (final value in meta.crTotalCoeff) _nonNegative(value),
+      ],
+      sliceId: meta.sliceId,
+    );
+  }
+}
+
+int _nonNegative(int value) => value < 0 ? 0 : value;
+
+const List<int> _lumaBlockX = <int>[
+  0,
+  1,
+  0,
+  1,
+  2,
+  3,
+  2,
+  3,
+  0,
+  1,
+  0,
+  1,
+  2,
+  3,
+  2,
+  3,
+];
+const List<int> _lumaBlockY = <int>[
+  0,
+  0,
+  1,
+  1,
+  0,
+  0,
+  1,
+  1,
+  2,
+  2,
+  3,
+  3,
+  2,
+  2,
+  3,
+  3,
+];
+
+const List<int> _codedBlockPatternIntra = <int>[
+  47,
+  31,
+  15,
+  0,
+  23,
+  27,
+  29,
+  30,
+  7,
+  11,
+  13,
+  14,
+  39,
+  43,
+  45,
+  46,
+  16,
+  3,
+  5,
+  10,
+  12,
+  19,
+  21,
+  26,
+  28,
+  35,
+  37,
+  42,
+  44,
+  1,
+  2,
+  4,
+  8,
+  17,
+  18,
+  20,
+  24,
+  6,
+  9,
+  22,
+  25,
+  32,
+  33,
+  34,
+  36,
+  40,
+  38,
+  41,
+];
+
+const List<int> _codedBlockPatternInter = <int>[
+  0,
+  16,
+  1,
+  2,
+  4,
+  8,
+  32,
+  3,
+  5,
+  10,
+  12,
+  15,
+  47,
+  7,
+  11,
+  13,
+  14,
+  6,
+  9,
+  31,
+  35,
+  37,
+  42,
+  44,
+  33,
+  34,
+  36,
+  40,
+  39,
+  43,
+  45,
+  46,
+  17,
+  18,
+  20,
+  24,
+  19,
+  21,
+  26,
+  28,
+  23,
+  27,
+  29,
+  30,
+  22,
+  25,
+  38,
+  41,
+];
+
+typedef _SliceDecodeResult = ({int qpY, int intra, int inter, int skipped});
+
+_SliceDecodeResult _decodeSlice({
+  required SliceHeader header,
+  required _FrameState state,
+  required List<_DecodedPicture> references,
+  required int sliceId,
+  required int initialQpY,
+}) {
+  final reader = header.reader;
+  final mbCount = state.macroblocks.length;
+  var mbAddr = header.firstMbInSlice;
+  if (mbAddr < 0 || mbAddr >= mbCount) {
+    throw FormatException('first_mb_in_slice=$mbAddr is outside the picture');
+  }
+
+  var qpY = initialQpY;
+  var intra = 0;
+  var inter = 0;
+  var skipped = 0;
+
+  while (mbAddr < mbCount && moreRbspData(reader)) {
+    if (header.sliceType == H264SliceType.p) {
+      final skipRun = readUE(reader);
+      if (skipRun > mbCount - mbAddr) {
+        throw FormatException(
+          'mb_skip_run=$skipRun exceeds ${mbCount - mbAddr} remaining MBs',
+        );
+      }
+      for (var i = 0; i < skipRun; i++) {
+        _decodeSkippedMacroblock(
+          state: state,
+          reference: references.first,
+          header: header,
+          mbAddr: mbAddr,
+          sliceId: sliceId,
+          qpY: qpY,
+        );
+        mbAddr++;
+        skipped++;
+      }
+      if (mbAddr >= mbCount || !moreRbspData(reader)) break;
+    }
+
+    final int macroblockStart = reader.bitPos;
+    final _MacroblockDecodeResult result;
+    try {
+      result = _decodeMacroblock(
+        reader: reader,
+        header: header,
+        state: state,
+        references: references,
+        mbAddr: mbAddr,
+        sliceId: sliceId,
+        previousQpY: qpY,
+      );
+    } catch (error) {
+      throw FormatException(
+        'Macroblock $mbAddr failed at bit ${reader.bitPos} '
+        '(start $macroblockStart): $error',
+      );
+    }
+    qpY = result.qpY;
+    if (result.isIntra) {
+      intra++;
+    } else {
+      inter++;
+    }
+    mbAddr++;
+  }
+
+  readRbspTrailingBits(reader);
+  return (qpY: qpY, intra: intra, inter: inter, skipped: skipped);
+}
+
+void _decodeSkippedMacroblock({
+  required _FrameState state,
+  required _DecodedPicture reference,
+  required SliceHeader header,
+  required int mbAddr,
+  required int sliceId,
+  required int qpY,
+}) {
+  final mbX = mbAddr % state.mbWidth;
+  final mbY = mbAddr ~/ state.mbWidth;
+  final x = mbX * 16;
+  final y = mbY * 16;
+  final vector = derivePSkipMotionVector(
+    grid: state.motion,
+    macroblockX: x,
+    macroblockY: y,
+    currentSliceId: sliceId,
+  );
+  writeInterPrediction420(
+    reference: reference.buffer,
+    destination: state.picture,
+    x: x,
+    y: y,
+    width: 16,
+    height: 16,
+    motionVector: vector,
+  );
+  state.motion.setPartition(
+    x: x,
+    y: y,
+    width: 16,
+    height: 16,
+    vector: vector,
+    referenceIndex: 0,
+    sliceId: sliceId,
+  );
+
+  final meta = state.macroblocks[mbAddr];
+  meta
+    ..decoded = true
+    ..isIntra = false
+    ..sliceId = sliceId
+    ..qpY = qpY
+    ..qpCb = _chromaQp(qpY, header.pps.chromaQpIndexOffset)
+    ..qpCr = _chromaQp(qpY, header.pps.secondChromaQpIndexOffset)
+    ..lumaDcTotalCoeff = 0;
+  meta.lumaTotalCoeff.fillRange(0, 16, 0);
+  meta.cbTotalCoeff.fillRange(0, 4, 0);
+  meta.crTotalCoeff.fillRange(0, 4, 0);
+  meta.lumaReconstructed.fillRange(0, 16, true);
+}
+
+typedef _MacroblockDecodeResult = ({int qpY, bool isIntra});
+
+_MacroblockDecodeResult _decodeMacroblock({
+  required BitReader reader,
+  required SliceHeader header,
+  required _FrameState state,
+  required List<_DecodedPicture> references,
+  required int mbAddr,
+  required int sliceId,
+  required int previousQpY,
+}) {
+  final codedType = readUE(reader);
+  final isPSlice = header.sliceType == H264SliceType.p;
+  final isInter = isPSlice && codedType <= 4;
+  final intraType = isInter ? -1 : codedType - (isPSlice ? 5 : 0);
+  h264DecoderTrace?.call(
+    'mb=$mbAddr start=${reader.bitPos} codedType=$codedType '
+    'intraType=$intraType',
+  );
+  if (!isInter && (intraType < 0 || intraType > 25)) {
+    throw FormatException(
+      'Invalid ${header.sliceType.name} mb_type=$codedType at MB $mbAddr',
+    );
+  }
+
+  final mbX = mbAddr % state.mbWidth;
+  final mbY = mbAddr ~/ state.mbWidth;
+  final meta = state.macroblocks[mbAddr];
+  if (meta.decoded) throw FormatException('Macroblock $mbAddr decoded twice');
+  meta
+    ..sliceId = sliceId
+    ..isIntra = !isInter;
+
+  if (intraType == 25) {
+    _decodePcmMacroblock(reader, state, mbAddr, sliceId);
+    return (qpY: previousQpY, isIntra: true);
+  }
+
+  final isIntra4x4 = intraType == 0;
+  final isIntra16x16 = intraType >= 1 && intraType <= 24;
+  meta.usesIntra4x4 = isIntra4x4;
+
+  var intra16Mode = 2;
+  var intraChromaMode = 0;
+  var codedBlockPatternLuma = 0;
+  var codedBlockPatternChroma = 0;
+
+  if (isInter) {
+    _decodeInterPrediction(
+      reader: reader,
+      header: header,
+      state: state,
+      references: references,
+      mbAddr: mbAddr,
+      sliceId: sliceId,
+      codedType: codedType,
+    );
+    final code = readUE(reader);
+    if (code >= _codedBlockPatternInter.length) {
+      throw FormatException('Invalid inter coded_block_pattern code $code');
+    }
+    final pattern = _codedBlockPatternInter[code];
+    codedBlockPatternLuma = pattern & 15;
+    codedBlockPatternChroma = pattern >> 4;
+  } else if (isIntra16x16) {
+    final value = intraType - 1;
+    intra16Mode = value & 3;
+    final group = value ~/ 4;
+    codedBlockPatternChroma = group % 3;
+    codedBlockPatternLuma = group >= 3 ? 15 : 0;
+    intraChromaMode = readUE(reader);
+    _validateIntraChromaMode(intraChromaMode);
+  } else {
+    _readIntra4x4Modes(
+      reader: reader,
+      state: state,
+      mbAddr: mbAddr,
+      sliceId: sliceId,
+      constrainedIntra: header.pps.constrainedIntraPredFlag,
+    );
+    intraChromaMode = readUE(reader);
+    _validateIntraChromaMode(intraChromaMode);
+    final code = readUE(reader);
+    if (code >= _codedBlockPatternIntra.length) {
+      throw FormatException('Invalid intra coded_block_pattern code $code');
+    }
+    final pattern = _codedBlockPatternIntra[code];
+    codedBlockPatternLuma = pattern & 15;
+    codedBlockPatternChroma = pattern >> 4;
+  }
+
+  var qpY = previousQpY;
+  if (isIntra16x16 ||
+      codedBlockPatternLuma != 0 ||
+      codedBlockPatternChroma != 0) {
+    final delta = readSE(reader);
+    qpY = (previousQpY + delta + 52) % 52;
+  }
+  final qpCb = _chromaQp(qpY, header.pps.chromaQpIndexOffset);
+  final qpCr = _chromaQp(qpY, header.pps.secondChromaQpIndexOffset);
+  meta
+    ..qpY = qpY
+    ..qpCb = qpCb
+    ..qpCr = qpCr;
+
+  final residual = _decodeResidual(
+    reader: reader,
+    state: state,
+    mbAddr: mbAddr,
+    isIntra16x16: isIntra16x16,
+    codedBlockPatternLuma: codedBlockPatternLuma,
+    codedBlockPatternChroma: codedBlockPatternChroma,
+  );
+  h264DecoderTrace?.call(
+    'mb=$mbAddr residualEnd=${reader.bitPos} i4=$isIntra4x4 '
+    'i16=$isIntra16x16 cbpL=$codedBlockPatternLuma '
+    'cbpC=$codedBlockPatternChroma qp=$qpY',
+  );
+
+  if (isIntra16x16) {
+    _reconstructIntra16(
+      state: state,
+      header: header,
+      mbAddr: mbAddr,
+      sliceId: sliceId,
+      mode: intra16Mode,
+      qpY: qpY,
+      lumaCoefficients: residual.luma,
+    );
+  } else if (isIntra4x4) {
+    _reconstructIntra4x4(
+      state: state,
+      header: header,
+      mbAddr: mbAddr,
+      sliceId: sliceId,
+      qpY: qpY,
+      lumaCoefficients: residual.luma,
+    );
+  } else {
+    _addInterLumaResidual(state, mbAddr, qpY, residual.luma);
+  }
+
+  if (isInter) {
+    _addInterChromaResidual(
+      state: state,
+      mbAddr: mbAddr,
+      qpCb: qpCb,
+      qpCr: qpCr,
+      cbCoefficients: residual.cb,
+      crCoefficients: residual.cr,
+    );
+  } else {
+    _reconstructIntraChroma(
+      state: state,
+      header: header,
+      mbAddr: mbAddr,
+      sliceId: sliceId,
+      mode: intraChromaMode,
+      qpCb: qpCb,
+      qpCr: qpCr,
+      cbCoefficients: residual.cb,
+      crCoefficients: residual.cr,
+    );
+    state.motion.setIntraPartition(
+      x: mbX * 16,
+      y: mbY * 16,
+      width: 16,
+      height: 16,
+      sliceId: sliceId,
+    );
+  }
+
+  meta
+    ..decoded = true
+    ..lumaDcTotalCoeff = _nonNegative(meta.lumaDcTotalCoeff);
+  for (var i = 0; i < 16; i++) {
+    if (meta.lumaTotalCoeff[i] < 0) meta.lumaTotalCoeff[i] = 0;
+    meta.lumaReconstructed[i] = true;
+  }
+  for (var i = 0; i < 4; i++) {
+    if (meta.cbTotalCoeff[i] < 0) meta.cbTotalCoeff[i] = 0;
+    if (meta.crTotalCoeff[i] < 0) meta.crTotalCoeff[i] = 0;
+  }
+  return (qpY: qpY, isIntra: !isInter);
+}
+
+void _validateIntraChromaMode(int mode) {
+  if (mode < 0 || mode > 3) {
+    throw FormatException('Invalid intra_chroma_pred_mode=$mode');
+  }
+}
+
+void _decodePcmMacroblock(
+  BitReader reader,
+  _FrameState state,
+  int mbAddr,
+  int sliceId,
+) {
+  while ((reader.bitPos & 7) != 0) {
+    if (reader.readBit() != 0) {
+      throw FormatException('pcm_alignment_zero_bit is not zero at MB $mbAddr');
+    }
+  }
+  final luma = reader.readBytes(256);
+  final cb = reader.readBytes(64);
+  final cr = reader.readBytes(64);
+  final mbX = mbAddr % state.mbWidth;
+  final mbY = mbAddr ~/ state.mbWidth;
+  final x0 = mbX * 16;
+  final y0 = mbY * 16;
+  for (var y = 0; y < 16; y++) {
+    final destination = (y0 + y) * state.picture.lumaStride + x0;
+    state.picture.y.setRange(destination, destination + 16, luma, y * 16);
+  }
+  final cx0 = mbX * 8;
+  final cy0 = mbY * 8;
+  for (var y = 0; y < 8; y++) {
+    final destination = (cy0 + y) * state.picture.chromaStride + cx0;
+    state.picture.u.setRange(destination, destination + 8, cb, y * 8);
+    state.picture.v.setRange(destination, destination + 8, cr, y * 8);
+  }
+
+  final meta = state.macroblocks[mbAddr];
+  meta
+    ..decoded = true
+    ..isIntra = true
+    ..sliceId = sliceId
+    ..qpY = 0
+    ..qpCb = 0
+    ..qpCr = 0
+    ..lumaDcTotalCoeff = 16;
+  meta.lumaTotalCoeff.fillRange(0, 16, 16);
+  meta.cbTotalCoeff.fillRange(0, 4, 16);
+  meta.crTotalCoeff.fillRange(0, 4, 16);
+  meta.lumaReconstructed.fillRange(0, 16, true);
+  state.motion.setIntraPartition(
+    x: x0,
+    y: y0,
+    width: 16,
+    height: 16,
+    sliceId: sliceId,
+  );
+}
+
+void _readIntra4x4Modes({
+  required BitReader reader,
+  required _FrameState state,
+  required int mbAddr,
+  required int sliceId,
+  required bool constrainedIntra,
+}) {
+  final mbX = mbAddr % state.mbWidth;
+  final mbY = mbAddr ~/ state.mbWidth;
+  final meta = state.macroblocks[mbAddr];
+  for (var syntaxBlock = 0; syntaxBlock < 16; syntaxBlock++) {
+    final bx = _lumaBlockX[syntaxBlock];
+    final by = _lumaBlockY[syntaxBlock];
+    final raster = by * 4 + bx;
+    final left = _intraModeNeighbour(
+      state,
+      globalBlockX: mbX * 4 + bx - 1,
+      globalBlockY: mbY * 4 + by,
+      currentMbAddr: mbAddr,
+      sliceId: sliceId,
+      constrainedIntra: constrainedIntra,
+    );
+    final top = _intraModeNeighbour(
+      state,
+      globalBlockX: mbX * 4 + bx,
+      globalBlockY: mbY * 4 + by - 1,
+      currentMbAddr: mbAddr,
+      sliceId: sliceId,
+      constrainedIntra: constrainedIntra,
+    );
+    final predicted = mostProbableIntra4x4Mode(
+      leftAvail: left.available,
+      topAvail: top.available,
+      leftMode: left.mode,
+      topMode: top.mode,
+    );
+    final modeStart = reader.bitPos;
+    final previousFlag = reader.readBit();
+    final int mode;
+    if (previousFlag == 1) {
+      mode = predicted;
+    } else {
+      mode = mapRemToMode(predicted, reader.readBits(3));
+    }
+    h264DecoderTrace?.call(
+      'mb=$mbAddr intra4syntax=$syntaxBlock raster=$raster '
+      'modeStart=$modeStart prev=$previousFlag mode=$mode end=${reader.bitPos}',
+    );
+    if (mode < 0 || mode > 8) {
+      throw FormatException('Invalid Intra4x4 prediction mode $mode');
+    }
+    state.intra4x4Modes[mbAddr * 16 + raster] = mode;
+    meta.intraModeKnown[raster] = true;
+  }
+}
+
+({bool available, int mode}) _intraModeNeighbour(
+  _FrameState state, {
+  required int globalBlockX,
+  required int globalBlockY,
+  required int currentMbAddr,
+  required int sliceId,
+  required bool constrainedIntra,
+}) {
+  if (globalBlockX < 0 ||
+      globalBlockY < 0 ||
+      globalBlockX >= state.mbWidth * 4 ||
+      globalBlockY >= state.mbHeight * 4) {
+    return (available: false, mode: 2);
+  }
+  final mbX = globalBlockX >> 2;
+  final mbY = globalBlockY >> 2;
+  final mbAddr = mbY * state.mbWidth + mbX;
+  final meta = state.macroblocks[mbAddr];
+  if (meta.sliceId != sliceId || (constrainedIntra && !meta.isIntra)) {
+    return (available: false, mode: 2);
+  }
+  final raster = (globalBlockY & 3) * 4 + (globalBlockX & 3);
+  if (mbAddr == currentMbAddr) {
+    if (!meta.intraModeKnown[raster]) return (available: false, mode: 2);
+  } else if (!meta.decoded) {
+    return (available: false, mode: 2);
+  }
+  final mode = meta.usesIntra4x4
+      ? state.intra4x4Modes[mbAddr * 16 + raster]
+      : 2;
+  return (available: true, mode: mode);
+}
+
+class _InterPartition {
+  final int x;
+  final int y;
+  final int width;
+  final int height;
+  final InterPartitionKind kind;
+  final int partitionIndex;
+  int referenceIndex;
+
+  _InterPartition({
+    required this.x,
+    required this.y,
+    required this.width,
+    required this.height,
+    required this.kind,
+    this.partitionIndex = 0,
+    this.referenceIndex = 0,
+  });
+}
+
+void _decodeInterPrediction({
+  required BitReader reader,
+  required SliceHeader header,
+  required _FrameState state,
+  required List<_DecodedPicture> references,
+  required int mbAddr,
+  required int sliceId,
+  required int codedType,
+}) {
+  final mbX = mbAddr % state.mbWidth;
+  final mbY = mbAddr ~/ state.mbWidth;
+  final originX = mbX * 16;
+  final originY = mbY * 16;
+  final partitions = <_InterPartition>[];
+
+  if (codedType == 0) {
+    partitions.add(
+      _InterPartition(
+        x: originX,
+        y: originY,
+        width: 16,
+        height: 16,
+        kind: InterPartitionKind.p16x16,
+      ),
+    );
+  } else if (codedType == 1) {
+    for (var index = 0; index < 2; index++) {
+      partitions.add(
+        _InterPartition(
+          x: originX,
+          y: originY + index * 8,
+          width: 16,
+          height: 8,
+          kind: InterPartitionKind.p16x8,
+          partitionIndex: index,
+        ),
+      );
+    }
+  } else if (codedType == 2) {
+    for (var index = 0; index < 2; index++) {
+      partitions.add(
+        _InterPartition(
+          x: originX + index * 8,
+          y: originY,
+          width: 8,
+          height: 16,
+          kind: InterPartitionKind.p8x16,
+          partitionIndex: index,
+        ),
+      );
+    }
+  } else {
+    final subTypes = <int>[for (var i = 0; i < 4; i++) readUE(reader)];
+    for (final type in subTypes) {
+      if (type < 0 || type > 3) {
+        throw FormatException('Invalid P sub_mb_type=$type');
+      }
+    }
+    final referenceIndices = List<int>.filled(4, 0);
+    if (codedType == 3 && header.numRefIdxL0ActiveMinus1 > 0) {
+      for (var i = 0; i < 4; i++) {
+        referenceIndices[i] = readTE(reader, header.numRefIdxL0ActiveMinus1);
+      }
+    }
+    for (var subMb = 0; subMb < 4; subMb++) {
+      final baseX = originX + (subMb & 1) * 8;
+      final baseY = originY + (subMb >> 1) * 8;
+      final ref = referenceIndices[subMb];
+      switch (subTypes[subMb]) {
+        case 0:
+          partitions.add(
+            _InterPartition(
+              x: baseX,
+              y: baseY,
+              width: 8,
+              height: 8,
+              kind: InterPartitionKind.subMacroblock,
+              referenceIndex: ref,
+            ),
+          );
+          break;
+        case 1:
+          for (var part = 0; part < 2; part++) {
+            partitions.add(
+              _InterPartition(
+                x: baseX,
+                y: baseY + part * 4,
+                width: 8,
+                height: 4,
+                kind: InterPartitionKind.subMacroblock,
+                referenceIndex: ref,
+              ),
+            );
+          }
+          break;
+        case 2:
+          for (var part = 0; part < 2; part++) {
+            partitions.add(
+              _InterPartition(
+                x: baseX + part * 4,
+                y: baseY,
+                width: 4,
+                height: 8,
+                kind: InterPartitionKind.subMacroblock,
+                referenceIndex: ref,
+              ),
+            );
+          }
+          break;
+        case 3:
+          for (var part = 0; part < 4; part++) {
+            partitions.add(
+              _InterPartition(
+                x: baseX + (part & 1) * 4,
+                y: baseY + (part >> 1) * 4,
+                width: 4,
+                height: 4,
+                kind: InterPartitionKind.subMacroblock,
+                referenceIndex: ref,
+              ),
+            );
+          }
+          break;
+      }
+    }
+  }
+
+  if (codedType <= 2 && header.numRefIdxL0ActiveMinus1 > 0) {
+    for (final partition in partitions) {
+      partition.referenceIndex = readTE(reader, header.numRefIdxL0ActiveMinus1);
+    }
+  }
+
+  for (final partition in partitions) {
+    if (partition.referenceIndex >= references.length) {
+      throw FormatException(
+        'Reference index ${partition.referenceIndex} is unavailable in a '
+        '${references.length}-entry list 0',
+      );
+    }
+    final difference = MotionVector(readSE(reader), readSE(reader));
+    final predictor = deriveMotionVectorPredictor(
+      grid: state.motion,
+      partitionX: partition.x,
+      partitionY: partition.y,
+      partitionWidth: partition.width,
+      partitionHeight: partition.height,
+      referenceIndex: partition.referenceIndex,
+      partitionKind: partition.kind,
+      partitionIndex: partition.partitionIndex,
+      currentSliceId: sliceId,
+    );
+    final vector = predictor + difference;
+    writeInterPrediction420(
+      reference: references[partition.referenceIndex].buffer,
+      destination: state.picture,
+      x: partition.x,
+      y: partition.y,
+      width: partition.width,
+      height: partition.height,
+      motionVector: vector,
+    );
+    state.motion.setPartition(
+      x: partition.x,
+      y: partition.y,
+      width: partition.width,
+      height: partition.height,
+      vector: vector,
+      referenceIndex: partition.referenceIndex,
+      sliceId: sliceId,
+    );
+  }
+}
+
+typedef _ResidualData = ({
+  List<List<int>> luma,
+  List<List<int>> cb,
+  List<List<int>> cr,
+});
+
+_ResidualData _decodeResidual({
+  required BitReader reader,
+  required _FrameState state,
+  required int mbAddr,
+  required bool isIntra16x16,
+  required int codedBlockPatternLuma,
+  required int codedBlockPatternChroma,
+}) {
+  final meta = state.macroblocks[mbAddr];
+  final sliceId = meta.sliceId;
+  final luma = List<List<int>>.generate(16, (_) => List<int>.filled(16, 0));
+  final cb = List<List<int>>.generate(4, (_) => List<int>.filled(16, 0));
+  final cr = List<List<int>>.generate(4, (_) => List<int>.filled(16, 0));
+
+  if (isIntra16x16) {
+    // Intra16x16DCLevel uses the same neighbouring luma 4x4 TotalCoeff
+    // derivation as block 0. It must not use neighbouring DC-block counts.
+    final dcNc = _nCLuma(state, mbAddr, 0, 0, sliceId);
+    coeffTokenDebugContext = 'mb=$mbAddr Intra16DC nC=$dcNc';
+    final dc = decodeResidual4x4(reader, dcNc);
+    meta.lumaDcTotalCoeff = dc.totalCoeff;
+    for (var raster = 0; raster < 16; raster++) {
+      luma[raster][0] = dc.coeffs[raster];
+    }
+    for (var syntaxBlock = 0; syntaxBlock < 16; syntaxBlock++) {
+      final bx = _lumaBlockX[syntaxBlock];
+      final by = _lumaBlockY[syntaxBlock];
+      final raster = by * 4 + bx;
+      final group = syntaxBlock >> 2;
+      if ((codedBlockPatternLuma & (1 << group)) == 0) {
+        meta.lumaTotalCoeff[raster] = 0;
+        continue;
+      }
+      final nC = _nCLuma(state, mbAddr, bx, by, sliceId);
+      coeffTokenDebugContext =
+          'mb=$mbAddr Intra16AC block=$syntaxBlock raster=$raster nC=$nC';
+      final residual = decodeResidual4x4Ac(reader, nC);
+      meta.lumaTotalCoeff[raster] = residual.totalCoeff;
+      for (var coefficient = 1; coefficient < 16; coefficient++) {
+        luma[raster][coefficient] = residual.coeffs[coefficient];
+      }
+    }
+  } else {
+    meta.lumaDcTotalCoeff = 0;
+    for (var syntaxBlock = 0; syntaxBlock < 16; syntaxBlock++) {
+      final bx = _lumaBlockX[syntaxBlock];
+      final by = _lumaBlockY[syntaxBlock];
+      final raster = by * 4 + bx;
+      final group = syntaxBlock >> 2;
+      if ((codedBlockPatternLuma & (1 << group)) == 0) {
+        meta.lumaTotalCoeff[raster] = 0;
+        continue;
+      }
+      final nC = _nCLuma(state, mbAddr, bx, by, sliceId);
+      coeffTokenDebugContext =
+          'mb=$mbAddr Luma block=$syntaxBlock raster=$raster nC=$nC';
+      final residual = decodeResidual4x4(reader, nC);
+      meta.lumaTotalCoeff[raster] = residual.totalCoeff;
+      luma[raster] = List<int>.from(residual.coeffs);
+    }
+  }
+
+  if (codedBlockPatternChroma == 0) {
+    meta.cbTotalCoeff.fillRange(0, 4, 0);
+    meta.crTotalCoeff.fillRange(0, 4, 0);
+    coeffTokenDebugContext = '';
+    return (luma: luma, cb: cb, cr: cr);
+  }
+
+  coeffTokenDebugContext = 'mb=$mbAddr ChromaDC Cb';
+  final cbDc = decodeChromaDC2x2(reader);
+  coeffTokenDebugContext = 'mb=$mbAddr ChromaDC Cr';
+  final crDc = decodeChromaDC2x2(reader);
+  for (var block = 0; block < 4; block++) {
+    cb[block][0] = cbDc.coeffs4[block];
+    cr[block][0] = crDc.coeffs4[block];
+  }
+
+  if (codedBlockPatternChroma == 2) {
+    for (var block = 0; block < 4; block++) {
+      final bx = block & 1;
+      final by = block >> 1;
+      final nC = _nCChroma(state, mbAddr, bx, by, sliceId, isCb: true);
+      coeffTokenDebugContext = 'mb=$mbAddr ChromaAC Cb block=$block nC=$nC';
+      final residual = decodeResidual4x4Ac(reader, nC);
+      meta.cbTotalCoeff[block] = residual.totalCoeff;
+      for (var coefficient = 1; coefficient < 16; coefficient++) {
+        cb[block][coefficient] = residual.coeffs[coefficient];
+      }
+    }
+    for (var block = 0; block < 4; block++) {
+      final bx = block & 1;
+      final by = block >> 1;
+      final nC = _nCChroma(state, mbAddr, bx, by, sliceId, isCb: false);
+      coeffTokenDebugContext = 'mb=$mbAddr ChromaAC Cr block=$block nC=$nC';
+      final residual = decodeResidual4x4Ac(reader, nC);
+      meta.crTotalCoeff[block] = residual.totalCoeff;
+      for (var coefficient = 1; coefficient < 16; coefficient++) {
+        cr[block][coefficient] = residual.coeffs[coefficient];
+      }
+    }
+  } else {
+    meta.cbTotalCoeff.fillRange(0, 4, 0);
+    meta.crTotalCoeff.fillRange(0, 4, 0);
+  }
+  coeffTokenDebugContext = '';
+  return (luma: luma, cb: cb, cr: cr);
+}
+
+int _nCLuma(_FrameState state, int mbAddr, int bx, int by, int sliceId) {
+  final mbX = mbAddr % state.mbWidth;
+  final mbY = mbAddr ~/ state.mbWidth;
+  int? left;
+  int? top;
+  if (bx > 0) {
+    left = _known(state.macroblocks[mbAddr].lumaTotalCoeff[by * 4 + bx - 1]);
+  } else if (mbX > 0) {
+    final neighbor = state.metaAt(mbX - 1, mbY);
+    if (neighbor.decoded && neighbor.sliceId == sliceId) {
+      left = _known(neighbor.lumaTotalCoeff[by * 4 + 3]);
+    }
+  }
+  if (by > 0) {
+    top = _known(state.macroblocks[mbAddr].lumaTotalCoeff[(by - 1) * 4 + bx]);
+  } else if (mbY > 0) {
+    final neighbor = state.metaAt(mbX, mbY - 1);
+    if (neighbor.decoded && neighbor.sliceId == sliceId) {
+      top = _known(neighbor.lumaTotalCoeff[12 + bx]);
+    }
+  }
+  return _combineNc(left, top);
+}
+
+int _nCChroma(
+  _FrameState state,
+  int mbAddr,
+  int bx,
+  int by,
+  int sliceId, {
+  required bool isCb,
+}) {
+  final mbX = mbAddr % state.mbWidth;
+  final mbY = mbAddr ~/ state.mbWidth;
+  List<int> values(_MacroblockMeta meta) =>
+      isCb ? meta.cbTotalCoeff : meta.crTotalCoeff;
+  int? left;
+  int? top;
+  if (bx > 0) {
+    left = _known(values(state.macroblocks[mbAddr])[by * 2 + bx - 1]);
+  } else if (mbX > 0) {
+    final neighbor = state.metaAt(mbX - 1, mbY);
+    if (neighbor.decoded && neighbor.sliceId == sliceId) {
+      left = _known(values(neighbor)[by * 2 + 1]);
+    }
+  }
+  if (by > 0) {
+    top = _known(values(state.macroblocks[mbAddr])[(by - 1) * 2 + bx]);
+  } else if (mbY > 0) {
+    final neighbor = state.metaAt(mbX, mbY - 1);
+    if (neighbor.decoded && neighbor.sliceId == sliceId) {
+      top = _known(values(neighbor)[2 + bx]);
+    }
+  }
+  return _combineNc(left, top);
+}
+
+int? _known(int value) => value < 0 ? null : value;
+
+int _combineNc(int? left, int? top) {
+  if (left == null && top == null) return 0;
+  if (left == null) return top!;
+  if (top == null) return left;
+  return (left + top + 1) >> 1;
+}
+
+void _reconstructIntra16({
+  required _FrameState state,
+  required SliceHeader header,
+  required int mbAddr,
+  required int sliceId,
+  required int mode,
+  required int qpY,
+  required List<List<int>> lumaCoefficients,
+}) {
+  final mbX = mbAddr % state.mbWidth;
+  final mbY = mbAddr ~/ state.mbWidth;
+  final constrained = header.pps.constrainedIntraPredFlag;
+  final topAvailable = state.macroblockAvailable(
+    mbX,
+    mbY - 1,
+    sliceId: sliceId,
+    constrainedIntra: constrained,
+  );
+  final leftAvailable = state.macroblockAvailable(
+    mbX - 1,
+    mbY,
+    sliceId: sliceId,
+    constrainedIntra: constrained,
+  );
+  final topLeftAvailable = state.macroblockAvailable(
+    mbX - 1,
+    mbY - 1,
+    sliceId: sliceId,
+    constrainedIntra: constrained,
+  );
+  final prediction = List<int>.filled(256, 128);
+  predictIntra16(
+    mode: mode,
+    mbX: mbX,
+    mbY: mbY,
+    width: state.sps.codedWidth,
+    height: state.sps.codedHeight,
+    yPlane: state.picture.y,
+    out16: prediction,
+    topAvailable: topAvailable,
+    leftAvailable: leftAvailable,
+    topLeftAvailable: topLeftAvailable,
+  );
+
+  applyIntra16LumaDcHadamard(lumaCoefficients, qp: qpY);
+  final residuals = <List<int>>[
+    for (final coefficients in lumaCoefficients)
+      invTransform4x4(coefficients, qp: qpY, dcAlreadyScaled: true),
+  ];
+  _writeLumaMacroblock(state.picture, mbX, mbY, prediction, residuals);
+  state.macroblocks[mbAddr].lumaReconstructed.fillRange(0, 16, true);
+}
+
+void _reconstructIntra4x4({
+  required _FrameState state,
+  required SliceHeader header,
+  required int mbAddr,
+  required int sliceId,
+  required int qpY,
+  required List<List<int>> lumaCoefficients,
+}) {
+  final mbX = mbAddr % state.mbWidth;
+  final mbY = mbAddr ~/ state.mbWidth;
+  final constrained = header.pps.constrainedIntraPredFlag;
+  final meta = state.macroblocks[mbAddr];
+
+  for (var syntaxBlock = 0; syntaxBlock < 16; syntaxBlock++) {
+    final bx = _lumaBlockX[syntaxBlock];
+    final by = _lumaBlockY[syntaxBlock];
+    final raster = by * 4 + bx;
+    final globalX = mbX * 4 + bx;
+    final globalY = mbY * 4 + by;
+    bool available(int x, int y) => state.lumaBlockAvailable(
+      x,
+      y,
+      currentMbAddr: mbAddr,
+      sliceId: sliceId,
+      constrainedIntra: constrained,
+    );
+
+    final topAvailable = available(globalX, globalY - 1);
+    final leftAvailable = available(globalX - 1, globalY);
+    final topLeftAvailable = available(globalX - 1, globalY - 1);
+    final topRightAvailable = available(globalX + 1, globalY - 1);
+    final sampleX = globalX * 4;
+    final sampleY = globalY * 4;
+    final top = List<int>.filled(8, 128);
+    if (topAvailable) {
+      final row = (sampleY - 1) * state.picture.lumaStride;
+      for (var x = 0; x < 4; x++) {
+        top[x] = state.picture.y[row + sampleX + x];
+      }
+    }
+    if (topRightAvailable) {
+      final row = (sampleY - 1) * state.picture.lumaStride;
+      for (var x = 4; x < 8; x++) {
+        top[x] = state.picture.y[row + sampleX + x];
+      }
+    } else {
+      for (var x = 4; x < 8; x++) {
+        top[x] = top[3];
+      }
+    }
+    final left = List<int>.filled(4, 128);
+    if (leftAvailable) {
+      for (var y = 0; y < 4; y++) {
+        left[y] = state
+            .picture
+            .y[(sampleY + y) * state.picture.lumaStride + sampleX - 1];
+      }
+    }
+    final topLeft = topLeftAvailable
+        ? state.picture.y[(sampleY - 1) * state.picture.lumaStride +
+              sampleX -
+              1]
+        : 128;
+    final prediction = List<int>.filled(16, 128);
+    predictIntra4x4(
+      mode: state.intra4x4Modes[mbAddr * 16 + raster],
+      top: top,
+      left: left,
+      topLeft: topLeft,
+      out: prediction,
+      topAvailable: topAvailable,
+      leftAvailable: leftAvailable,
+      topLeftAvailable: topLeftAvailable,
+      topRightAvailable: topRightAvailable,
+    );
+    final residual = invTransform4x4(lumaCoefficients[raster], qp: qpY);
+    _write4x4PredictionAndResidual(
+      plane: state.picture.y,
+      stride: state.picture.lumaStride,
+      x: sampleX,
+      y: sampleY,
+      prediction: prediction,
+      residual: residual,
+    );
+    meta.lumaReconstructed[raster] = true;
+  }
+}
+
+void _reconstructIntraChroma({
+  required _FrameState state,
+  required SliceHeader header,
+  required int mbAddr,
+  required int sliceId,
+  required int mode,
+  required int qpCb,
+  required int qpCr,
+  required List<List<int>> cbCoefficients,
+  required List<List<int>> crCoefficients,
+}) {
+  final mbX = mbAddr % state.mbWidth;
+  final mbY = mbAddr ~/ state.mbWidth;
+  final constrained = header.pps.constrainedIntraPredFlag;
+  final topAvailable = state.macroblockAvailable(
+    mbX,
+    mbY - 1,
+    sliceId: sliceId,
+    constrainedIntra: constrained,
+  );
+  final leftAvailable = state.macroblockAvailable(
+    mbX - 1,
+    mbY,
+    sliceId: sliceId,
+    constrainedIntra: constrained,
+  );
+  final topLeftAvailable = state.macroblockAvailable(
+    mbX - 1,
+    mbY - 1,
+    sliceId: sliceId,
+    constrainedIntra: constrained,
+  );
+  final predictionCb = predictIntraChroma8x8(
+    mode: mode,
+    plane: state.picture.u,
+    width: state.sps.codedWidth,
+    height: state.sps.codedHeight,
+    mbX: mbX,
+    mbY: mbY,
+    topAvailable: topAvailable,
+    leftAvailable: leftAvailable,
+    topLeftAvailable: topLeftAvailable,
+  );
+  final predictionCr = predictIntraChroma8x8(
+    mode: mode,
+    plane: state.picture.v,
+    width: state.sps.codedWidth,
+    height: state.sps.codedHeight,
+    mbX: mbX,
+    mbY: mbY,
+    topAvailable: topAvailable,
+    leftAvailable: leftAvailable,
+    topLeftAvailable: topLeftAvailable,
+  );
+  final residualCb = _transformChroma(cbCoefficients, qpCb);
+  final residualCr = _transformChroma(crCoefficients, qpCr);
+  _writeChromaMacroblock(
+    plane: state.picture.u,
+    stride: state.picture.chromaStride,
+    mbX: mbX,
+    mbY: mbY,
+    prediction: predictionCb,
+    residuals: residualCb,
+  );
+  _writeChromaMacroblock(
+    plane: state.picture.v,
+    stride: state.picture.chromaStride,
+    mbX: mbX,
+    mbY: mbY,
+    prediction: predictionCr,
+    residuals: residualCr,
+  );
+}
+
+void _addInterLumaResidual(
+  _FrameState state,
+  int mbAddr,
+  int qpY,
+  List<List<int>> coefficients,
+) {
+  final mbX = mbAddr % state.mbWidth;
+  final mbY = mbAddr ~/ state.mbWidth;
+  for (var raster = 0; raster < 16; raster++) {
+    final residual = invTransform4x4(coefficients[raster], qp: qpY);
+    _add4x4Residual(
+      plane: state.picture.y,
+      stride: state.picture.lumaStride,
+      x: mbX * 16 + (raster & 3) * 4,
+      y: mbY * 16 + (raster >> 2) * 4,
+      residual: residual,
+    );
+  }
+  state.macroblocks[mbAddr].lumaReconstructed.fillRange(0, 16, true);
+}
+
+void _addInterChromaResidual({
+  required _FrameState state,
+  required int mbAddr,
+  required int qpCb,
+  required int qpCr,
+  required List<List<int>> cbCoefficients,
+  required List<List<int>> crCoefficients,
+}) {
+  final mbX = mbAddr % state.mbWidth;
+  final mbY = mbAddr ~/ state.mbWidth;
+  final residualCb = _transformChroma(cbCoefficients, qpCb);
+  final residualCr = _transformChroma(crCoefficients, qpCr);
+  for (var block = 0; block < 4; block++) {
+    final x = mbX * 8 + (block & 1) * 4;
+    final y = mbY * 8 + (block >> 1) * 4;
+    _add4x4Residual(
+      plane: state.picture.u,
+      stride: state.picture.chromaStride,
+      x: x,
+      y: y,
+      residual: residualCb[block],
+    );
+    _add4x4Residual(
+      plane: state.picture.v,
+      stride: state.picture.chromaStride,
+      x: x,
+      y: y,
+      residual: residualCr[block],
+    );
+  }
+}
+
+List<List<int>> _transformChroma(List<List<int>> coefficients, int qp) {
+  final rawDc = <int>[for (final block in coefficients) block[0]];
+  final scaledDc = inverseChromaDc2x2(rawDc, qp: qp);
+  final output = <List<int>>[];
+  for (var block = 0; block < 4; block++) {
+    final values = List<int>.from(coefficients[block]);
+    values[0] = scaledDc[block];
+    output.add(invTransform4x4(values, qp: qp, dcAlreadyScaled: true));
+  }
+  return output;
+}
+
+void _writeLumaMacroblock(
+  Yuv420PictureBuffer picture,
+  int mbX,
+  int mbY,
+  List<int> prediction,
+  List<List<int>> residuals,
+) {
+  for (var y = 0; y < 16; y++) {
+    final row = (mbY * 16 + y) * picture.lumaStride + mbX * 16;
+    for (var x = 0; x < 16; x++) {
+      final raster = (y >> 2) * 4 + (x >> 2);
+      final residual = residuals[raster][(y & 3) * 4 + (x & 3)];
+      picture.y[row + x] = clip8(prediction[y * 16 + x] + residual);
+    }
+  }
+}
+
+void _writeChromaMacroblock({
+  required Uint8List plane,
+  required int stride,
+  required int mbX,
+  required int mbY,
+  required List<int> prediction,
+  required List<List<int>> residuals,
+}) {
+  for (var y = 0; y < 8; y++) {
+    final row = (mbY * 8 + y) * stride + mbX * 8;
+    for (var x = 0; x < 8; x++) {
+      final raster = (y >> 2) * 2 + (x >> 2);
+      final residual = residuals[raster][(y & 3) * 4 + (x & 3)];
+      plane[row + x] = clip8(prediction[y * 8 + x] + residual);
+    }
+  }
+}
+
+void _write4x4PredictionAndResidual({
+  required Uint8List plane,
+  required int stride,
+  required int x,
+  required int y,
+  required List<int> prediction,
+  required List<int> residual,
+}) {
+  for (var row = 0; row < 4; row++) {
+    final offset = (y + row) * stride + x;
+    for (var column = 0; column < 4; column++) {
+      final index = row * 4 + column;
+      plane[offset + column] = clip8(prediction[index] + residual[index]);
+    }
+  }
+}
+
+void _add4x4Residual({
+  required Uint8List plane,
+  required int stride,
+  required int x,
+  required int y,
+  required List<int> residual,
+}) {
+  for (var row = 0; row < 4; row++) {
+    final offset = (y + row) * stride + x;
+    for (var column = 0; column < 4; column++) {
+      final index = row * 4 + column;
+      plane[offset + column] = clip8(plane[offset + column] + residual[index]);
+    }
+  }
+}
+
+int _chromaQp(int qpY, int offset) {
+  final qPi = (qpY + offset).clamp(0, 51).toInt();
+  if (qPi < 30) return qPi;
+  const table = <int>[
     29,
     30,
-    7,
-    11,
-    13,
-    14,
-    39,
-    43,
-    45,
-    46,
-    16,
-    3,
-    5,
-    10,
-    12,
-    19,
-    21,
-    26,
-    28,
-    35,
-    37,
-    42,
-    44,
-    1,
-    2,
-    4,
-    8,
-    17,
-    18,
-    20,
-    24,
-    6,
-    9,
-    22,
-    25,
+    31,
+    32,
     32,
     33,
     34,
+    34,
+    35,
+    35,
     36,
-    40,
+    36,
+    37,
+    37,
+    37,
     38,
-    41,
+    38,
+    38,
+    39,
+    39,
+    39,
+    39,
   ];
+  return table[qPi - 30];
+}
 
-  // residual_luma() syntax order is by 8x8 group, then 4x4 blocks in each group.
-  static const List<List<int>> _luma4x4ParseOrderBy8x8 = <List<int>>[
-    <int>[0, 1, 4, 5], // top-left 8x8
-    <int>[2, 3, 6, 7], // top-right 8x8
-    <int>[8, 9, 12, 13], // bottom-left 8x8
-    <int>[10, 11, 14, 15], // bottom-right 8x8
-  ];
-
-  bool _shouldLogMbAlign(int mbAddr) {
-    if (!_kAlignDebug) return false;
-    return mbAddr < _kAlignDebugMaxMb || (mbAddr % 128) == 0;
+Yuv420Frame _cropPicture(Yuv420PictureBuffer picture, SpsInfo sps) {
+  final width = sps.width;
+  final height = sps.height;
+  final left = sps.cropLeftPixels;
+  final top = sps.cropTopPixels;
+  final y = Uint8List(width * height);
+  for (var row = 0; row < height; row++) {
+    final source = (top + row) * picture.lumaStride + left;
+    y.setRange(row * width, (row + 1) * width, picture.y, source);
   }
-
-  void _alignLog(String msg) {
-    if (!_kAlignDebug) return;
-    if (_alignLogCount < _kAlignDebugMaxLines) {
-      _alignLogCount++;
-      debugPrint(msg);
-      return;
-    }
-    if (_alignLogCount == _kAlignDebugMaxLines) {
-      _alignLogCount++;
-      debugPrint('[ALIGN] suppressing further alignment logs');
-    }
+  final chromaWidth = width >> 1;
+  final chromaHeight = height >> 1;
+  final chromaLeft = left >> 1;
+  final chromaTop = top >> 1;
+  final u = Uint8List(chromaWidth * chromaHeight);
+  final v = Uint8List(chromaWidth * chromaHeight);
+  for (var row = 0; row < chromaHeight; row++) {
+    final source = (chromaTop + row) * picture.chromaStride + chromaLeft;
+    final destination = row * chromaWidth;
+    u.setRange(destination, destination + chromaWidth, picture.u, source);
+    v.setRange(destination, destination + chromaWidth, picture.v, source);
   }
-
-  void _logResidualStart({
-    required BitReader br,
-    required int mbAddr,
-    required String label,
-    required int nC,
-    required int startIdx,
-    required int maxCoeff,
-  }) {
-    if (!_shouldLogMbAlign(mbAddr)) return;
-    _alignLog(
-      '[ALIGN][RES-START] mb=$mbAddr bit=${br.bitPos} '
-      'label=$label nC=$nC startIdx=$startIdx maxCoeff=$maxCoeff '
-      'next24=${br.peekBitsStr(24)}',
-    );
-  }
-
-  Yuv420Frame? decodeIdrAccessUnit(List<Uint8List> nals) {
-    try {
-      lastError = null;
-      _alignLogCount = 0;
-      int coeffDbgCount = 0;
-      coeffTokenDebugLog = (message) {
-        if (coeffDbgCount < 12) {
-          coeffDbgCount++;
-          debugPrint('[CAVLC] $message');
-        }
-      };
-
-      // Parse SPS/PPS if present in this AU
-      for (final nal in nals) {
-        if (nal.isEmpty) continue;
-        final t = nal[0] & 0x1F;
-        if (t == 7) {
-          final s = parseSpsNal(nal);
-          _sps = s;
-          _spsById[s.spsId] = s;
-        }
-        if (t == 8) {
-          final p = parsePpsNal(nal);
-          _pps = p;
-          _ppsById[p.ppsId] = p;
-          debugPrint(
-            'entropyCodingModeFlag=${_pps!.entropyCodingModeFlag} '
-            'ppsId=${_pps!.ppsId} spsId=${_pps!.spsId} '
-            'sliceGroups=${_pps!.numSliceGroupsMinus1} mapType=${_pps!.sliceGroupMapType} '
-            't8x8=${_pps!.transform8x8ModeFlag} '
-            'deblock=${_pps!.deblockingFilterControlPresentFlag} '
-            'redundant=${_pps!.redundantPicCntPresentFlag}',
-          );
-        }
-      }
-
-      final sps = _sps;
-      final pps = _pps;
-      if (sps == null || pps == null) {
-        lastError = 'missing SPS/PPS for AU';
-        return null;
-      }
-
-      // Collect all IDR slices in this AU (one frame may use multiple slices).
-      final idrSlices = <Uint8List>[];
-      for (final nal in nals) {
-        if (nal.isNotEmpty && ((nal[0] & 0x1F) == 5)) {
-          idrSlices.add(nal);
-        }
-      }
-      if (idrSlices.isEmpty) {
-        lastError = 'no IDR slices in AU';
-        return null;
-      }
-      debugPrint('idrSlicesInAu=${idrSlices.length}');
-
-      final w = sps.width;
-      final h = sps.height;
-
-      final y = Uint8List(w * h);
-      final u = Uint8List((w >> 1) * (h >> 1));
-      final v = Uint8List((w >> 1) * (h >> 1));
-
-      // Neutral initialize
-      y.fillRange(0, y.length, 128);
-      u.fillRange(0, u.length, 128);
-      v.fillRange(0, v.length, 128);
-
-      final mbW = (w + 15) >> 4;
-      final mbH = (h + 15) >> 4;
-      final mbCount = mbW * mbH;
-
-      _frameIntra4x4Modes = List<int>.filled(mbCount * 16, 2);
-
-      final nc = NcContext(mbWidth: mbW, mbHeight: mbH);
-
-      for (final idr in idrSlices) {
-        try {
-          _decodeIdrSlice(idr, sps, pps, y, u, v, nc, mbW, mbH);
-        } catch (e, st) {
-          lastError = 'slice decode error: $e';
-          debugPrint('_decodeIdrSlice error: $e\n$st');
-          break;
-        }
-      }
-      return Yuv420Frame(width: w, height: h, y: y, u: u, v: v);
-    } catch (e, st) {
-      lastError = 'decode exception: $e';
-      debugPrint('decodeIdrAccessUnit error: $e\n$st');
-      // Fail-soft: caller can skip this AU and keep playback alive.
-      return null;
-    } finally {
-      coeffTokenDebugLog = null;
-      coeffTokenDebugContext = '';
-    }
-  }
-
-  void _decodeIdrSlice(
-    Uint8List idrNal,
-    SpsInfo sps,
-    PpsInfo pps,
-    Uint8List yPlane,
-    Uint8List uPlane,
-    Uint8List vPlane,
-    NcContext nc,
-    int mbW,
-    int mbH,
-  ) {
-    // Keep full NAL payload bytes. Trimming trailing 0x00 can corrupt valid
-    // length-prefixed (MP4/avcC) NAL units and desync CAVLC bit parsing.
-    final rbsp = ebspToRbsp(idrNal.sublist(1));
-    final br = BitReader(rbsp);
-    final sliceHdrStartBit = br.bitPos;
-    final nalRefIdc = (idrNal[0] >> 5) & 0x03;
-    final nalUnitType = idrNal[0] & 0x1F;
-    final isIdr = nalUnitType == 5;
-
-    // --- slice header (minimal) ---
-    final firstMbInSlice = readUE(br);
-    final rawSliceType = readUE(br);
-    final sliceType = rawSliceType % 5; // 2 = I, 4 = SI
-    final picParameterSetId = readUE(br);
-    final ppsUsed = _ppsById[picParameterSetId] ?? pps;
-    final spsUsed = _spsById[ppsUsed.spsId] ?? sps;
-    br.readBits(spsUsed.log2MaxFrameNumMinus4 + 4); // frame_num
-    debugPrint(
-      '[SLICE] firstMb=$firstMbInSlice rawType=$rawSliceType type=$sliceType '
-      'ppsId=$picParameterSetId ppsSpsId=${ppsUsed.spsId} '
-      'cabac=${ppsUsed.entropyCodingModeFlag} t8x8=${ppsUsed.transform8x8ModeFlag}',
-    );
-
-    // This decoder only supports I/SI slices.
-    if (sliceType != 2 && sliceType != 4) {
-      debugPrint('[SLICE] skip unsupported sliceType=$sliceType');
-      return;
-    }
-    if (ppsUsed.entropyCodingModeFlag) {
-      debugPrint('[SLICE] skip CABAC ppsId=$picParameterSetId');
-      return;
-    }
-    if (ppsUsed.numSliceGroupsMinus1 != 0) {
-      debugPrint(
-        '[SLICE] skip FMO ppsId=$picParameterSetId groups=${ppsUsed.numSliceGroupsMinus1}',
-      );
-      return;
-    }
-    if (ppsUsed.transform8x8ModeFlag) {
-      debugPrint(
-        '[SLICE] warning transform8x8 stream ppsId=$picParameterSetId (partial support)',
-      );
-    }
-
-    bool fieldPicFlag = false;
-    if (!spsUsed.frameMbsOnlyFlag) {
-      fieldPicFlag = br.readBit() == 1;
-      if (fieldPicFlag) br.readBit(); // bottom_field_flag
-    }
-
-    if (isIdr) {
-      readUE(br); // idr_pic_id
-    }
-
-    if (spsUsed.picOrderCntType == 0) {
-      br.readBits(spsUsed.log2MaxPicOrderCntLsbMinus4 + 4); // pic_order_cnt_lsb
-      if (ppsUsed.bottomFieldPicOrderInFramePresentFlag && !fieldPicFlag) {
-        readSE(br); // delta_pic_order_cnt_bottom
-      }
-    } else if (spsUsed.picOrderCntType == 1 &&
-        !spsUsed.deltaPicOrderAlwaysZeroFlag) {
-      readSE(br); // delta_pic_order_cnt[0]
-      if (ppsUsed.bottomFieldPicOrderInFramePresentFlag && !fieldPicFlag) {
-        readSE(br); // delta_pic_order_cnt[1]
-      }
-    }
-
-    if (ppsUsed.redundantPicCntPresentFlag) {
-      readUE(br); // redundant_pic_cnt
-    }
-
-    if (nalRefIdc != 0) {
-      if (isIdr) {
-        br.readBit(); // no_output_of_prior_pics_flag
-        br.readBit(); // long_term_reference_flag
-      }
-    }
-
-    if (ppsUsed.entropyCodingModeFlag && sliceType != 2 && sliceType != 4) {
-      readUE(br); // cabac_init_idc (not expected in this decoder path)
-    }
-    final sliceQpDelta = readSE(br);
-
-    if (ppsUsed.deblockingFilterControlPresentFlag) {
-      final disableDeblockingFilterIdc = readUE(br);
-      if (disableDeblockingFilterIdc != 1) {
-        readSE(br); // slice_alpha_c0_offset_div2
-        readSE(br); // slice_beta_offset_div2
-      }
-    }
-    if (ppsUsed.numSliceGroupsMinus1 > 0 &&
-        (ppsUsed.sliceGroupMapType == 3 ||
-            ppsUsed.sliceGroupMapType == 4 ||
-            ppsUsed.sliceGroupMapType == 5)) {
-      final rate = ppsUsed.sliceGroupChangeRateMinus1 + 1;
-      final picSizeInMapUnits = mbW * mbH;
-      final x = ((picSizeInMapUnits + rate - 1) ~/ rate) + 1;
-      int bits = 0;
-      while ((1 << bits) < x) {
-        bits++;
-      }
-      if (bits > 0) {
-        br.readBits(bits); // slice_group_change_cycle
-      }
-    }
-    final sliceHdrEndBit = br.bitPos;
-    _alignLog(
-      '[ALIGN][SLICE-HDR] firstMb=$firstMbInSlice ppsId=$picParameterSetId '
-      'start=$sliceHdrStartBit end=$sliceHdrEndBit len=${sliceHdrEndBit - sliceHdrStartBit} '
-      'bitsLeft=${br.bitsLeft} next24=${br.peekBitsStr(24)}',
-    );
-
-    int mbQpY = 26 + ppsUsed.picInitQpMinus26 + sliceQpDelta;
-    if (mbQpY < 0) mbQpY = 0;
-    if (mbQpY > 51) mbQpY = 51;
-
-    final mbCount = mbW * mbH;
-    int decodedMbs = 0;
-    int intra4Count = 0;
-    int intra16Count = 0;
-    int pcmCount = 0;
-    int unsupportedCount = 0;
-    int mbErrorCount = 0;
-    final unsupportedTypes = <int>[];
-
-    int mbAddr = firstMbInSlice;
-    if (mbAddr < 0) mbAddr = 0;
-    if (mbAddr >= mbCount) return;
-
-    bool sliceAborted = false;
-    while (!br.eof && mbAddr < mbCount && moreRbspData(br)) {
-      if (br.bitsLeft <= 0) {
-        lastError = 'bitstream exhausted at mb=$mbAddr';
-        break;
-      }
-      final mbTrace = _MbTrace(mbAddr, br.bitPos);
-      if (_shouldLogMbAlign(mbAddr)) {
-        _alignLog(
-          '[ALIGN][MB-START] mb=$mbAddr bit=${br.bitPos} '
-          'bitsLeft=${br.bitsLeft} next24=${br.peekBitsStr(24)}',
-        );
-      }
-      try {
-        final mbType = readUE(br);
-        mbTrace.hit('after_mb_type', br.bitPos);
-        final mbTypeVal = mbType;
-        final mbX = mbAddr % mbW;
-        final mbY = mbAddr ~/ mbW;
-        final mbIndex = mbY * mbW + mbX;
-
-        // I_PCM
-        if (mbType == 25) {
-          pcmCount++;
-          br.byteAlign();
-          final luma = br.readBytes(256);
-          final cb = br.readBytes(64);
-          final cr = br.readBytes(64);
-          _writeIpcm(
-            mbX,
-            mbY,
-            spsUsed.width,
-            spsUsed.height,
-            luma,
-            cb,
-            cr,
-            yPlane,
-            uPlane,
-            vPlane,
-          );
-
-          // reset contexts for this MB
-          nc.setLumaDc(mbX, mbY, 0);
-          for (int i = 0; i < 16; i++) nc.setLuma(mbX, mbY, i, 0);
-          for (int i = 0; i < 4; i++) {
-            nc.setChromaU(mbX, mbY, i, 0);
-            nc.setChromaV(mbX, mbY, i, 0);
-          }
-          for (int i = 0; i < 16; i++)
-            _frameIntra4x4Modes[mbIndex * 16 + i] = 2;
-
-          mbAddr++;
-          decodedMbs++;
-          continue;
-        }
-
-        final isIntra4x4 = (mbType == 0);
-        final isIntra16x16 = (mbType >= 1 && mbType <= 24);
-
-        if (!isIntra4x4 && !isIntra16x16) {
-          if (_kStopOnUnsupportedMbType) {
-            throw StateError(
-              'unsupported mb_type=$mbType at mb=$mbAddr bit=${br.bitPos} '
-              'cp=${mbTrace.summary()} next32=${br.peekBitsStr(32)}',
-            );
-          }
-          unsupportedCount++;
-          if (unsupportedTypes.length < 12) {
-            unsupportedTypes.add(mbType);
-          }
-          if (!moreRbspData(br)) {
-            break;
-          }
-          nc.setLumaDc(mbX, mbY, 0);
-          for (int i = 0; i < 16; i++) nc.setLuma(mbX, mbY, i, 0);
-          for (int i = 0; i < 4; i++) {
-            nc.setChromaU(mbX, mbY, i, 0);
-            nc.setChromaV(mbX, mbY, i, 0);
-          }
-          for (int i = 0; i < 16; i++)
-            _frameIntra4x4Modes[mbIndex * 16 + i] = 2;
-          mbAddr++;
-          decodedMbs++;
-          continue;
-        }
-        if (isIntra4x4) {
-          intra4Count++;
-        } else {
-          intra16Count++;
-        }
-
-        // ---------- parse prediction modes + CBP ----------
-        final intra4x4Modes = List<int>.filled(16, 2); // filled as we parse
-        int intra16Mode = 2; // DC
-        int intraChromaPredMode = 0; // DC
-        int codedBlockPatternLuma = 0; // 0 => none
-        int codedBlockPatternChroma = 0; // 0 => none
-        int transform8x8Flag = 0;
-
-        if (isIntra16x16) {
-          final i16 = mbType - 1; // 0..23
-          // I_16x16 mb_type encoding carries Intra16x16PredMode directly:
-          // 0=Vertical, 1=Horizontal, 2=DC, 3=Plane.
-          const i16PredModeMap = <int>[0, 1, 2, 3];
-          intra16Mode = i16PredModeMap[i16 & 0x3];
-
-          // Intra16x16 mb_type coding:
-          // group = floor(i16/4) in 0..5, where:
-          //   chroma = group % 3  (0..2)
-          //   lumaAC = floor(group/3) (0 or 1) -> CodedBlockPatternLuma 0 or 15
-          final group = i16 ~/ 4;
-          codedBlockPatternChroma = group % 3; // 0..2
-          codedBlockPatternLuma = (group ~/ 3) != 0 ? 15 : 0;
-
-          intraChromaPredMode = readUE(br);
-          if (intraChromaPredMode < 0 || intraChromaPredMode > 3) {
-            intraChromaPredMode = 0;
-          }
-          mbTrace.hit('after_intra_pred', br.bitPos);
-          mbTrace.hit('after_cbp', br.bitPos);
-        } else {
-          if (ppsUsed.transform8x8ModeFlag) {
-            // Required syntax element for I_NxN when PPS enables 8x8 transform.
-            transform8x8Flag = br.readBit();
-          }
-
-          // --- Correct Intra4x4 MPM parsing (B1.3) ---
-          int getLeftMode(int blk) {
-            final bx = blk & 3;
-            final by = blk >> 2;
-            if (bx > 0) return intra4x4Modes[blk - 1];
-            if (mbX > 0) {
-              // left MB, same block-row => block (by*4 + 3)
-              final leftMbIndex = (mbY * mbW + (mbX - 1));
-              return _frameIntra4x4Modes[leftMbIndex * 16 + (by * 4 + 3)];
-            }
-            return 2;
-          }
-
-          int getTopMode(int blk) {
-            final bx = blk & 3;
-            final by = blk >> 2;
-            if (by > 0) return intra4x4Modes[blk - 4];
-            if (mbY > 0) {
-              // top MB bottom block row => blocks 12..15
-              final topMbIndex = ((mbY - 1) * mbW + mbX);
-              return _frameIntra4x4Modes[topMbIndex * 16 + (12 + bx)];
-            }
-            return 2;
-          }
-
-          if (transform8x8Flag == 1) {
-            // Intra8x8 syntax: consume prediction mode bits to stay in sync.
-            // Decode path remains 4x4-only for now; abort this slice gracefully.
-            for (int b8 = 0; b8 < 4; b8++) {
-              final prev = br.readBit();
-              if (prev == 0) {
-                br.readBits(3); // rem_intra8x8_pred_mode
-              }
-            }
-            lastError = 'unsupported Intra8x8 residual (t8x8)';
-            debugPrint(
-              '[SLICE] abort unsupported Intra8x8 residual at mb=$mbAddr x=$mbX y=$mbY',
-            );
-            sliceAborted = true;
-            break;
-          } else {
-            for (int b = 0; b < 16; b++) {
-              final bx = b & 3;
-              final by = b >> 2;
-
-              final leftAvail = (bx > 0) || (mbX > 0);
-              final topAvail = (by > 0) || (mbY > 0);
-
-              final leftMode = getLeftMode(b);
-              final topMode = getTopMode(b);
-
-              final mpm = mostProbableIntra4x4Mode(
-                leftAvail: leftAvail,
-                topAvail: topAvail,
-                leftMode: leftMode,
-                topMode: topMode,
-              );
-
-              final prevFlag = br.readBit();
-              if (prevFlag == 1) {
-                intra4x4Modes[b] = mpm;
-              } else {
-                final rem = br.readBits(3); // 0..7
-                intra4x4Modes[b] = mapRemToMode(mpm, rem); // 0..8
-              }
-            }
-          }
-          mbTrace.hit('after_intra_pred', br.bitPos);
-
-          // Store modes for future MPM across MBs
-          for (int i = 0; i < 16; i++) {
-            _frameIntra4x4Modes[mbIndex * 16 + i] = intra4x4Modes[i];
-          }
-
-          intraChromaPredMode = readUE(br);
-          if (intraChromaPredMode < 0 || intraChromaPredMode > 3) {
-            intraChromaPredMode = 0;
-          }
-
-          // coded_block_pattern (UE)
-          final cbpCodeNum = readUE(br);
-          final cbp = (cbpCodeNum >= 0 && cbpCodeNum < _cbpIntraMap.length)
-              ? _cbpIntraMap[cbpCodeNum]
-              : 0;
-          codedBlockPatternLuma = cbp & 0x0F; // 4 bits for luma
-          codedBlockPatternChroma = (cbp >> 4) & 0x03; // 2 bits for chroma
-          mbTrace.hit('after_cbp', br.bitPos);
-        }
-
-        // mb_qp_delta if any residual present
-        int? mbQpDeltaVal;
-        if (isIntra16x16 ||
-            codedBlockPatternLuma != 0 ||
-            codedBlockPatternChroma != 0) {
-          final mbQpDelta = readSE(br);
-          mbQpDeltaVal = mbQpDelta;
-          mbQpY = (mbQpY + mbQpDelta + 104) % 52;
-          mbTrace.hit('after_mb_qp_delta', br.bitPos);
-        } else {
-          mbTrace.hit('mb_qp_delta_skipped', br.bitPos);
-        }
-
-        // ---------- decode LUMA ----------
-        mbTrace.hit('residual_start', br.bitPos);
-        if (isIntra16x16) {
-          // Intra16 pred
-          final pred16 = List<int>.filled(256, 128);
-          final yInts = yPlane.map((e) => e).toList();
-          predictIntra16(
-            mode: intra16Mode,
-            mbX: mbX,
-            mbY: mbY,
-            width: spsUsed.width,
-            height: spsUsed.height,
-            yPlane: yInts,
-            out16: pred16,
-          );
-
-          final resBlocks = List<List<int>>.generate(
-            16,
-            (_) => List<int>.filled(16, 0),
-          );
-          final coeffBlocks = List<List<int>>.generate(
-            16,
-            (_) => List<int>.filled(16, 0),
-          );
-
-          // Intra16x16 luma DC block is always present in syntax.
-          final nCDc = nc.calcNCForLuma16Dc(mbX, mbY);
-          coeffTokenDebugContext = 'mb=$mbAddr x=$mbX y=$mbY I16DC nC=$nCDc';
-          _logResidualStart(
-            br: br,
-            mbAddr: mbAddr,
-            label: 'I16DC',
-            nC: nCDc,
-            startIdx: 0,
-            maxCoeff: 16,
-          );
-          final dc = decodeResidual4x4(br, nCDc);
-          nc.setLumaDc(mbX, mbY, dc.totalCoeff);
-          if (dc.coeffs.length >= 16) {
-            for (int b = 0; b < 16; b++) {
-              coeffBlocks[b][0] = dc.coeffs[b];
-            }
-          }
-
-          // Parse I16 AC in residual_luma() syntax order.
-          for (int g = 0; g < 4; g++) {
-            final groupCoded = ((codedBlockPatternLuma >> g) & 1) != 0;
-            final group = _luma4x4ParseOrderBy8x8[g];
-            if (!groupCoded) {
-              for (final blk in group) {
-                nc.setLuma(mbX, mbY, blk, 0);
-              }
-              continue;
-            }
-
-            for (final blk in group) {
-              final bx = blk & 3;
-              final by = blk >> 2;
-              final nCval = nc.calcNCForLuma4x4(mbX, mbY, bx, by);
-              coeffTokenDebugContext =
-                  'mb=$mbAddr x=$mbX y=$mbY I16AC blk=$blk bx=$bx by=$by nC=$nCval';
-              _logResidualStart(
-                br: br,
-                mbAddr: mbAddr,
-                label: 'I16AC blk=$blk',
-                nC: nCval,
-                startIdx: 1,
-                maxCoeff: 15,
-              );
-              final r = decodeResidual4x4Ac(br, nCval);
-              nc.setLuma(mbX, mbY, blk, r.totalCoeff);
-
-              final coeff = r.coeffs;
-              if (coeff.length >= 16) {
-                for (int k = 1; k < 16; k++) {
-                  coeffBlocks[blk][k] = coeff[k];
-                }
-              } else {
-                for (int k = 1; k < coeff.length && k < 16; k++) {
-                  coeffBlocks[blk][k] = coeff[k];
-                }
-              }
-            }
-          }
-
-          // Intra16x16 luma DC path:
-          // gather 16 block DCs, inverse Hadamard + scaling, then merge back.
-          applyIntra16LumaDcHadamard(coeffBlocks);
-
-          for (int b = 0; b < 16; b++) {
-            resBlocks[b] = invTransform4x4(coeffBlocks[b], qp: mbQpY);
-          }
-
-          _writePredPlusRes16(
-            mbX,
-            mbY,
-            spsUsed.width,
-            spsUsed.height,
-            pred16,
-            resBlocks,
-            yPlane,
-          );
-
-          // Intra16x16 doesn't set intra4x4 modes—set to DC for safety
-          for (int i = 0; i < 16; i++)
-            _frameIntra4x4Modes[mbIndex * 16 + i] = 2;
-        } else {
-          nc.setLumaDc(mbX, mbY, 0);
-          // Parse residual first in residual_luma() syntax order.
-          final coeffBlocks = List<List<int>>.generate(
-            16,
-            (_) => List<int>.filled(16, 0),
-          );
-          for (int g = 0; g < 4; g++) {
-            final groupCoded = ((codedBlockPatternLuma >> g) & 1) != 0;
-            final group = _luma4x4ParseOrderBy8x8[g];
-            if (!groupCoded) {
-              for (final blk in group) {
-                nc.setLuma(mbX, mbY, blk, 0);
-              }
-              continue;
-            }
-
-            for (final blk in group) {
-              final bx = blk & 3;
-              final by = blk >> 2;
-              final nCval = nc.calcNCForLuma4x4(mbX, mbY, bx, by);
-              coeffTokenDebugContext =
-                  'mb=$mbAddr x=$mbX y=$mbY I4 blk=$blk bx=$bx by=$by nC=$nCval';
-              _logResidualStart(
-                br: br,
-                mbAddr: mbAddr,
-                label: 'I4 blk=$blk',
-                nC: nCval,
-                startIdx: 0,
-                maxCoeff: 16,
-              );
-              final r = decodeResidual4x4(br, nCval);
-              nc.setLuma(mbX, mbY, blk, r.totalCoeff);
-              if (r.coeffs.length >= 16) {
-                coeffBlocks[blk] = List<int>.from(r.coeffs);
-              } else {
-                final safe = List<int>.filled(16, 0);
-                for (int i = 0; i < r.coeffs.length; i++) {
-                  safe[i] = r.coeffs[i];
-                }
-                coeffBlocks[blk] = safe;
-              }
-            }
-          }
-
-          // Intra4x4: reconstruct in raster order so neighbor pixels are ready.
-          for (int by = 0; by < 4; by++) {
-            for (int bx = 0; bx < 4; bx++) {
-              final blk = by * 4 + bx;
-
-              final top8 = _sampleTop8(
-                yPlane,
-                spsUsed.width,
-                spsUsed.height,
-                mbX,
-                mbY,
-                bx,
-                by,
-              );
-              final left4 = _sampleLeft4(
-                yPlane,
-                spsUsed.width,
-                spsUsed.height,
-                mbX,
-                mbY,
-                bx,
-                by,
-              );
-              final topLeft = _sampleTopLeft(
-                yPlane,
-                spsUsed.width,
-                spsUsed.height,
-                mbX,
-                mbY,
-                bx,
-                by,
-              );
-
-              final pred4 = List<int>.filled(16, 128);
-              predictIntra4x4(
-                mode: intra4x4Modes[blk],
-                top: top8,
-                left: left4,
-                topLeft: topLeft,
-                out: pred4,
-              );
-
-              final res = invTransform4x4(coeffBlocks[blk], qp: mbQpY);
-
-              _write4x4(
-                mbX,
-                mbY,
-                bx,
-                by,
-                spsUsed.width,
-                spsUsed.height,
-                pred4,
-                res,
-                yPlane,
-              );
-            }
-          }
-        }
-
-        // ---------- decode CHROMA 4:2:0 ----------
-        _decodeChroma420(
-          br,
-          mbAddr,
-          mbX,
-          mbY,
-          spsUsed.width,
-          spsUsed.height,
-          uPlane,
-          vPlane,
-          intraChromaPredMode,
-          codedBlockPatternChroma,
-          _calcQpC(mbQpY, ppsUsed.chromaQpIndexOffset),
-          nc,
-        );
-
-        mbTrace.hit('mb_end', br.bitPos);
-        if (br.bitPos <= mbTrace.startBit) {
-          throw StateError(
-            'macroblock consumed no bits '
-            '(mb=$mbAddr start=${mbTrace.startBit} end=${br.bitPos} cp=${mbTrace.summary()})',
-          );
-        }
-        if (_shouldLogMbAlign(mbAddr)) {
-          _alignLog(
-            '[ALIGN][MB-END] mb=$mbAddr used=${br.bitPos - mbTrace.startBit} '
-            'cp=${mbTrace.summary()} next16=${br.peekBitsStr(16)}',
-          );
-          _alignLog(
-            '[ALIGN][MB-META] mb=$mbAddr type=$mbTypeVal '
-            'i16=$isIntra16x16 cbpL=$codedBlockPatternLuma cbpC=$codedBlockPatternChroma '
-            'chromaPred=$intraChromaPredMode mbQpY=$mbQpY mbQpDelta=${mbQpDeltaVal ?? 'skip'}',
-          );
-        }
-
-        mbAddr++;
-        decodedMbs++;
-      } catch (e, st) {
-        mbErrorCount++;
-        lastError = 'slice parse error at mb=$mbAddr: $e';
-        _alignLog(
-          '[ALIGN][MB-ERR] mb=$mbAddr bit=${br.bitPos} bitsLeft=${br.bitsLeft} '
-          'cp=${mbTrace.summary()} next32=${br.peekBitsStr(32)} err=$e',
-        );
-        if (_kStopOnFirstMbError) {
-          debugPrint('[SLICE] abort on first mb error at mb=$mbAddr: $e');
-          sliceAborted = true;
-          break;
-        }
-        if (mbErrorCount <= 16) {
-          debugPrint('[SLICE] recover at mb=$mbAddr: $e\n$st');
-        } else if (mbErrorCount == 17) {
-          debugPrint('[SLICE] recover: suppressing further MB error traces');
-        }
-
-        // Keep decoder running: neutralize this MB context and advance.
-        final mbX = mbAddr % mbW;
-        final mbY = mbAddr ~/ mbW;
-        final mbIndex = mbY * mbW + mbX;
-        nc.setLumaDc(mbX, mbY, 0);
-        for (int i = 0; i < 16; i++) {
-          nc.setLuma(mbX, mbY, i, 0);
-          _frameIntra4x4Modes[mbIndex * 16 + i] = 2;
-        }
-        for (int i = 0; i < 4; i++) {
-          nc.setChromaU(mbX, mbY, i, 0);
-          nc.setChromaV(mbX, mbY, i, 0);
-        }
-
-        mbAddr++;
-        decodedMbs++;
-
-        // Hard-stop if stream is fully exhausted or too damaged.
-        if (br.eof || mbErrorCount > (mbCount >> 1)) {
-          sliceAborted = true;
-          break;
-        }
-        continue;
-      }
-    }
-
-    debugPrint(
-      '[SLICE] decoded mbs=$mbAddr / $mbCount moreRbsp=${moreRbspData(br)} bitsLeft=${br.bitsLeft}',
-    );
-    _alignLog(
-      '[ALIGN][SLICE-END] decodedMbs=$decodedMbs mbAddr=$mbAddr '
-      'bit=${br.bitPos} bitsLeft=${br.bitsLeft} moreRbsp=${moreRbspData(br)} '
-      'next32=${br.peekBitsStr(32)}',
-    );
-    debugPrint(
-      '[IDR] firstMb=$firstMbInSlice ${spsUsed.width}x${spsUsed.height} mbs=$decodedMbs/$mbCount '
-      'i4=$intra4Count i16=$intra16Count pcm=$pcmCount '
-      'unsupported=$unsupportedCount types=$unsupportedTypes eof=${br.eof}',
-    );
-    if (sliceAborted && lastError == null) {
-      lastError = 'slice aborted';
-    }
-  }
-
-  // ===============================
-  // Chroma decode (simple B1.2/B1.3)
-  // ===============================
-  void _decodeChroma420(
-    BitReader br,
-    int mbAddr,
-    int mbX,
-    int mbY,
-    int w,
-    int h,
-    Uint8List u,
-    Uint8List v,
-    int intraChromaPredMode,
-    int codedBlockPatternChroma,
-    int chromaQp,
-    NcContext nc,
-  ) {
-    final predU = predictIntraChroma8x8(
-      mode: intraChromaPredMode,
-      plane: u,
-      width: w,
-      height: h,
-      mbX: mbX,
-      mbY: mbY,
-    );
-    final predV = predictIntraChroma8x8(
-      mode: intraChromaPredMode,
-      plane: v,
-      width: w,
-      height: h,
-      mbX: mbX,
-      mbY: mbY,
-    );
-
-    final coeffU = List<List<int>>.generate(4, (_) => List<int>.filled(16, 0));
-    final coeffV = List<List<int>>.generate(4, (_) => List<int>.filled(16, 0));
-
-    List<int> dcU = List<int>.filled(4, 0);
-    List<int> dcV = List<int>.filled(4, 0);
-    if (codedBlockPatternChroma > 0) {
-      coeffTokenDebugContext = 'mb=$mbAddr x=$mbX y=$mbY ChromaDC U';
-      _logResidualStart(
-        br: br,
-        mbAddr: mbAddr,
-        label: 'ChromaDC U',
-        nC: -1,
-        startIdx: 0,
-        maxCoeff: 4,
-      );
-      dcU = inverseChromaDc2x2(decodeChromaDC2x2(br).coeffs4);
-      coeffTokenDebugContext = 'mb=$mbAddr x=$mbX y=$mbY ChromaDC V';
-      _logResidualStart(
-        br: br,
-        mbAddr: mbAddr,
-        label: 'ChromaDC V',
-        nC: -1,
-        startIdx: 0,
-        maxCoeff: 4,
-      );
-      dcV = inverseChromaDc2x2(decodeChromaDC2x2(br).coeffs4);
-    }
-
-    if (codedBlockPatternChroma == 2) {
-      // residual() syntax is component-major for chroma AC:
-      // decode all Cb(=U) blocks first, then all Cr(=V) blocks.
-      for (int blk = 0; blk < 4; blk++) {
-        final bx = blk & 1;
-        final by = blk >> 1;
-        final nCu = nc.calcNCForChroma4x4(
-          mbX: mbX,
-          mbY: mbY,
-          bx: bx,
-          by: by,
-          isU: true,
-        );
-        coeffTokenDebugContext =
-            'mb=$mbAddr x=$mbX y=$mbY ChromaAC U blk=$blk bx=$bx by=$by nC=$nCu';
-        _logResidualStart(
-          br: br,
-          mbAddr: mbAddr,
-          label: 'ChromaAC U blk=$blk',
-          nC: nCu,
-          startIdx: 1,
-          maxCoeff: 15,
-        );
-        final rU = decodeResidual4x4Ac(br, nCu);
-        nc.setChromaU(mbX, mbY, blk, rU.totalCoeff);
-        if (rU.coeffs.length >= 16) {
-          coeffU[blk] = List<int>.from(rU.coeffs);
-        } else {
-          final safe = List<int>.filled(16, 0);
-          for (int i = 0; i < rU.coeffs.length; i++) {
-            safe[i] = rU.coeffs[i];
-          }
-          coeffU[blk] = safe;
-        }
-      }
-
-      for (int blk = 0; blk < 4; blk++) {
-        final bx = blk & 1;
-        final by = blk >> 1;
-        final nCv = nc.calcNCForChroma4x4(
-          mbX: mbX,
-          mbY: mbY,
-          bx: bx,
-          by: by,
-          isU: false,
-        );
-        coeffTokenDebugContext =
-            'mb=$mbAddr x=$mbX y=$mbY ChromaAC V blk=$blk bx=$bx by=$by nC=$nCv';
-        _logResidualStart(
-          br: br,
-          mbAddr: mbAddr,
-          label: 'ChromaAC V blk=$blk',
-          nC: nCv,
-          startIdx: 1,
-          maxCoeff: 15,
-        );
-        final rV = decodeResidual4x4Ac(br, nCv);
-        nc.setChromaV(mbX, mbY, blk, rV.totalCoeff);
-        if (rV.coeffs.length >= 16) {
-          coeffV[blk] = List<int>.from(rV.coeffs);
-        } else {
-          final safe = List<int>.filled(16, 0);
-          for (int i = 0; i < rV.coeffs.length; i++) {
-            safe[i] = rV.coeffs[i];
-          }
-          coeffV[blk] = safe;
-        }
-      }
-    } else {
-      for (int i = 0; i < 4; i++) {
-        nc.setChromaU(mbX, mbY, i, 0);
-        nc.setChromaV(mbX, mbY, i, 0);
-      }
-    }
-
-    mergeChromaDcIntoCoeffBlocks(coeffU, dcU);
-    mergeChromaDcIntoCoeffBlocks(coeffV, dcV);
-
-    final resU = List<List<int>>.generate(4, (_) => List<int>.filled(16, 0));
-    final resV = List<List<int>>.generate(4, (_) => List<int>.filled(16, 0));
-    for (int i = 0; i < 4; i++) {
-      resU[i] = invTransform4x4(coeffU[i], qp: chromaQp);
-      resV[i] = invTransform4x4(coeffV[i], qp: chromaQp);
-    }
-
-    _writeChroma8x8PredRes(mbX, mbY, w, h, u, predU, resU);
-    _writeChroma8x8PredRes(mbX, mbY, w, h, v, predV, resV);
-  }
-
-  void _writeChroma8x8PredRes(
-    int mbX,
-    int mbY,
-    int w,
-    int h,
-    Uint8List plane,
-    List<int> pred8x8,
-    List<List<int>> resBlocks4x4,
-  ) {
-    final cw = w >> 1;
-    final ch = h >> 1;
-    final x0 = mbX * 8;
-    final y0 = mbY * 8;
-
-    for (int by = 0; by < 2; by++) {
-      for (int bx = 0; bx < 2; bx++) {
-        final blk = by * 2 + bx;
-        final block = resBlocks4x4[blk];
-        final baseX = x0 + bx * 4;
-        final baseY = y0 + by * 4;
-
-        for (int j = 0; j < 4; j++) {
-          final yy = baseY + j;
-          if (yy >= ch) continue;
-          final row = yy * cw;
-          final predRow = (by * 4 + j) * 8;
-          for (int i = 0; i < 4; i++) {
-            final xx = baseX + i;
-            if (xx >= cw) continue;
-
-            final pred = pred8x8[predRow + bx * 4 + i];
-            final res = block[j * 4 + i];
-            plane[row + xx] = clip8(pred + res);
-          }
-        }
-      }
-    }
-  }
-
-  int _calcQpC(int qpY, int chromaOffset) {
-    int qPi = qpY + chromaOffset;
-    if (qPi < 0) qPi = 0;
-    if (qPi > 51) qPi = 51;
-    if (qPi < 30) return qPi;
-    const table = <int>[
-      29,
-      30,
-      31,
-      32,
-      32,
-      33,
-      34,
-      34,
-      35,
-      35,
-      36,
-      36,
-      37,
-      37,
-      37,
-      38,
-      38,
-      38,
-      39,
-      39,
-      39,
-      39,
-    ];
-    return table[qPi - 30];
-  }
-
-  // ===============================
-  // Neighbor sampling helpers (safe)
-  // ===============================
-  List<int> _sampleTop8(
-    Uint8List y,
-    int w,
-    int h,
-    int mbX,
-    int mbY,
-    int bx,
-    int by,
-  ) {
-    final out = List<int>.filled(8, 128);
-    final x0 = mbX * 16 + bx * 4;
-    final y0 = mbY * 16 + by * 4;
-    if (y0 <= 0 || y0 - 1 >= h) return out;
-
-    final row = (y0 - 1) * w;
-    int last = 128;
-
-    for (int i = 0; i < 8; i++) {
-      final xx = x0 + i;
-      if (xx >= 0 && xx < w) {
-        last = y[row + xx];
-        out[i] = last;
-      } else {
-        out[i] = last; // repeat last sample for top-right padding
-      }
-    }
-    return out;
-  }
-
-  List<int> _sampleLeft4(
-    Uint8List y,
-    int w,
-    int h,
-    int mbX,
-    int mbY,
-    int bx,
-    int by,
-  ) {
-    final out = List<int>.filled(4, 128);
-    final x0 = mbX * 16 + bx * 4;
-    final y0 = mbY * 16 + by * 4;
-    if (x0 <= 0 || x0 - 1 >= w) return out;
-
-    for (int j = 0; j < 4; j++) {
-      final yy = y0 + j;
-      if (yy >= 0 && yy < h) {
-        out[j] = y[yy * w + (x0 - 1)];
-      }
-    }
-    return out;
-  }
-
-  int _sampleTopLeft(
-    Uint8List y,
-    int w,
-    int h,
-    int mbX,
-    int mbY,
-    int bx,
-    int by,
-  ) {
-    final x0 = mbX * 16 + bx * 4;
-    final y0 = mbY * 16 + by * 4;
-    if (x0 <= 0 || y0 <= 0) return 128;
-    if (x0 - 1 >= w || y0 - 1 >= h) return 128;
-    return y[(y0 - 1) * w + (x0 - 1)];
-  }
-
-  // ===============================
-  // Write helpers
-  // ===============================
-  void _write4x4(
-    int mbX,
-    int mbY,
-    int bx,
-    int by,
-    int w,
-    int h,
-    List<int> pred,
-    List<int> res,
-    Uint8List yPlane,
-  ) {
-    final x0 = mbX * 16 + bx * 4;
-    final y0 = mbY * 16 + by * 4;
-
-    for (int j = 0; j < 4; j++) {
-      final yy = y0 + j;
-      if (yy >= h) continue;
-      final row = yy * w;
-      for (int i = 0; i < 4; i++) {
-        final xx = x0 + i;
-        if (xx >= w) continue;
-        yPlane[row + xx] = clip8(pred[j * 4 + i] + res[j * 4 + i]);
-      }
-    }
-  }
-
-  void _writePredPlusRes16(
-    int mbX,
-    int mbY,
-    int w,
-    int h,
-    List<int> pred16,
-    List<List<int>> resBlocks,
-    Uint8List yOut,
-  ) {
-    final x0 = mbX * 16;
-    final y0 = mbY * 16;
-
-    for (int j = 0; j < 16; j++) {
-      final yy = y0 + j;
-      if (yy >= h) continue;
-      final row = yy * w;
-      for (int i = 0; i < 16; i++) {
-        final xx = x0 + i;
-        if (xx >= w) continue;
-        final bx = i >> 2;
-        final by = j >> 2;
-        final bi = (j & 3) * 4 + (i & 3);
-        final block = resBlocks[by * 4 + bx];
-        yOut[row + xx] = clip8(pred16[j * 16 + i] + block[bi]);
-      }
-    }
-  }
-
-  void _writeIpcm(
-    int mbX,
-    int mbY,
-    int w,
-    int h,
-    Uint8List luma,
-    Uint8List cb,
-    Uint8List cr,
-    Uint8List y,
-    Uint8List u,
-    Uint8List v,
-  ) {
-    // luma 16x16
-    final x0 = mbX * 16;
-    final y0 = mbY * 16;
-    for (int j = 0; j < 16; j++) {
-      final yy = y0 + j;
-      if (yy >= h) break;
-      final row = yy * w;
-      for (int i = 0; i < 16; i++) {
-        final xx = x0 + i;
-        if (xx >= w) break;
-        y[row + xx] = luma[j * 16 + i];
-      }
-    }
-
-    // chroma 8x8
-    final cw = w >> 1;
-    final ch = h >> 1;
-    final cx0 = mbX * 8;
-    final cy0 = mbY * 8;
-    for (int j = 0; j < 8; j++) {
-      final yy = cy0 + j;
-      if (yy >= ch) break;
-      final row = yy * cw;
-      for (int i = 0; i < 8; i++) {
-        final xx = cx0 + i;
-        if (xx >= cw) break;
-        u[row + xx] = cb[j * 8 + i];
-        v[row + xx] = cr[j * 8 + i];
-      }
-    }
-  }
+  return Yuv420Frame(width: width, height: height, y: y, u: u, v: v);
 }

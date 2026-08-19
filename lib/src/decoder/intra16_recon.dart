@@ -1,5 +1,3 @@
-import 'dart:math';
-
 int clip8(int v) => v < 0 ? 0 : (v > 255 ? 255 : v);
 
 /// Very simplified inverse transform for 4x4 (not full spec-accurate scaling).
@@ -70,25 +68,35 @@ void predictIntra16({
   if (mode == 0) {
     // vertical
     for (int j = 0; j < 16; j++) {
-      for (int i = 0; i < 16; i++) pred[j * 16 + i] = top[i];
+      for (int i = 0; i < 16; i++) {
+        pred[j * 16 + i] = top[i];
+      }
     }
   } else if (mode == 1) {
     // horizontal
     for (int j = 0; j < 16; j++) {
-      for (int i = 0; i < 16; i++) pred[j * 16 + i] = left[j];
+      for (int i = 0; i < 16; i++) {
+        pred[j * 16 + i] = left[j];
+      }
     }
   } else if (mode == 2) {
     // DC
     int sum = 0;
-    for (int i = 0; i < 16; i++) sum += top[i] + left[i];
+    for (int i = 0; i < 16; i++) {
+      sum += top[i] + left[i];
+    }
     final dc = sum ~/ 32;
-    for (int k = 0; k < 256; k++) pred[k] = dc;
+    for (int k = 0; k < 256; k++) {
+      pred[k] = dc;
+    }
   } else {
     // Plane (simplified: average of top & left gradients)
     final base =
         ((top.reduce((a, b) => a + b) + left.reduce((a, b) => a + b)) ~/ 32);
     for (int j = 0; j < 16; j++) {
-      for (int i = 0; i < 16; i++) pred[j * 16 + i] = base;
+      for (int i = 0; i < 16; i++) {
+        pred[j * 16 + i] = base;
+      }
     }
   }
 }

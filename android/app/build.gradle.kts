@@ -24,7 +24,9 @@ android {
         applicationId = "com.example.ndvy_player"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        // The pure-Dart PCM sink calls the NDK AAudio API directly through
+        // dart:ffi. AAudio is part of the stable NDK API from Android 8.0.
+        minSdk = 26
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName

@@ -21,6 +21,7 @@ class PureFrameView extends StatefulWidget {
 
 class _PureFrameViewState extends State<PureFrameView> {
   ui.Image? _img;
+  int _decodeGeneration = 0;
 
   @override
   void didUpdateWidget(covariant PureFrameView oldWidget) {
@@ -37,6 +38,7 @@ class _PureFrameViewState extends State<PureFrameView> {
   }
 
   Future<void> _makeImage() async {
+    final generation = ++_decodeGeneration;
     final c = Completer<ui.Image>();
     ui.decodeImageFromPixels(
       widget.rgba,
@@ -46,8 +48,20 @@ class _PureFrameViewState extends State<PureFrameView> {
       (img) => c.complete(img),
     );
     final img = await c.future;
-    if (!mounted) return;
+    if (!mounted || generation != _decodeGeneration) {
+      img.dispose();
+      return;
+    }
+    final previous = _img;
     setState(() => _img = img);
+    previous?.dispose();
+  }
+
+  @override
+  void dispose() {
+    _decodeGeneration++;
+    _img?.dispose();
+    super.dispose();
   }
 
   @override
@@ -65,17 +79,5 @@ class _PureFrameViewState extends State<PureFrameView> {
         child: RawImage(image: _img, filterQuality: FilterQuality.none),
       ),
     );
-  }
-
-  double _coverScale({
-    required double srcW,
-    required double srcH,
-    required double dstW,
-    required double dstH,
-  }) {
-    final sx = dstW / srcW;
-    final sy = dstH / srcH;
-    // use "contain" instead of cover to avoid cropping:
-    return sx < sy ? sx : sy;
   }
 }

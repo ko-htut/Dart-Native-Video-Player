@@ -1,4 +1,5 @@
 import 'dart:typed_data';
+
 import 'bitreader.dart';
 import 'exp_golomb.dart';
 import 'rbsp.dart';
@@ -6,155 +7,177 @@ import 'rbsp.dart';
 class PpsInfo {
   final int ppsId;
   final int spsId;
-  final bool entropyCodingModeFlag; // false => CAVLC
+  final bool entropyCodingModeFlag;
+  final bool bottomFieldPicOrderInFramePresentFlag;
   final int numSliceGroupsMinus1;
   final int sliceGroupMapType;
   final bool sliceGroupChangeDirectionFlag;
   final int sliceGroupChangeRateMinus1;
   final int picSizeInMapUnitsMinus1;
+  final int numRefIdxL0DefaultActiveMinus1;
+  final int numRefIdxL1DefaultActiveMinus1;
+  final bool weightedPredFlag;
+  final int weightedBipredIdc;
   final int picInitQpMinus26;
+  final int picInitQsMinus26;
   final int chromaQpIndexOffset;
-  final bool bottomFieldPicOrderInFramePresentFlag;
   final bool deblockingFilterControlPresentFlag;
+  final bool constrainedIntraPredFlag;
   final bool redundantPicCntPresentFlag;
   final bool transform8x8ModeFlag;
+  final bool picScalingMatrixPresentFlag;
+  final int secondChromaQpIndexOffset;
 
   const PpsInfo({
     required this.ppsId,
     required this.spsId,
     required this.entropyCodingModeFlag,
+    required this.bottomFieldPicOrderInFramePresentFlag,
     required this.numSliceGroupsMinus1,
     required this.sliceGroupMapType,
     required this.sliceGroupChangeDirectionFlag,
     required this.sliceGroupChangeRateMinus1,
     required this.picSizeInMapUnitsMinus1,
+    required this.numRefIdxL0DefaultActiveMinus1,
+    required this.numRefIdxL1DefaultActiveMinus1,
+    required this.weightedPredFlag,
+    required this.weightedBipredIdc,
     required this.picInitQpMinus26,
+    required this.picInitQsMinus26,
     required this.chromaQpIndexOffset,
-    required this.bottomFieldPicOrderInFramePresentFlag,
     required this.deblockingFilterControlPresentFlag,
+    required this.constrainedIntraPredFlag,
     required this.redundantPicCntPresentFlag,
     required this.transform8x8ModeFlag,
+    required this.picScalingMatrixPresentFlag,
+    required this.secondChromaQpIndexOffset,
   });
 }
 
-PpsInfo parsePpsNal(Uint8List ppsNal) {
-  final rbsp = ebspToRbsp(ppsNal.sublist(1));
-  final br = BitReader(rbsp);
+PpsInfo parsePpsNal(Uint8List nal, {int chromaFormatIdc = 1}) {
+  if (nal.length < 2 || (nal.first & 0x1f) != 8) {
+    throw const FormatException('PPS NAL is missing or has the wrong NAL type');
+  }
 
+  final br = BitReader(ebspToRbsp(Uint8List.sublistView(nal, 1)));
   final ppsId = readUE(br);
   final spsId = readUE(br);
   final entropyCodingModeFlag = br.readBit() == 1;
   final bottomFieldPicOrderInFramePresentFlag = br.readBit() == 1;
 
   final numSliceGroupsMinus1 = readUE(br);
-  int sliceGroupMapType = 0;
-  bool sliceGroupChangeDirectionFlag = false;
-  int sliceGroupChangeRateMinus1 = 0;
-  int picSizeInMapUnitsMinus1 = 0;
+  var sliceGroupMapType = 0;
+  var sliceGroupChangeDirectionFlag = false;
+  var sliceGroupChangeRateMinus1 = 0;
+  var picSizeInMapUnitsMinus1 = 0;
+
   if (numSliceGroupsMinus1 > 0) {
     sliceGroupMapType = readUE(br);
-    if (sliceGroupMapType == 0) {
-      for (int i = 0; i <= numSliceGroupsMinus1; i++) {
-        readUE(br); // run_length_minus1[i]
-      }
-    } else if (sliceGroupMapType == 2) {
-      for (int i = 0; i < numSliceGroupsMinus1; i++) {
-        readUE(br); // top_left[i]
-        readUE(br); // bottom_right[i]
-      }
-    } else if (sliceGroupMapType == 3 ||
-        sliceGroupMapType == 4 ||
-        sliceGroupMapType == 5) {
-      sliceGroupChangeDirectionFlag = br.readBit() == 1;
-      sliceGroupChangeRateMinus1 = readUE(br);
-    } else if (sliceGroupMapType == 6) {
-      picSizeInMapUnitsMinus1 = readUE(br);
-      final numGroups = numSliceGroupsMinus1 + 1;
-      int bits = 0;
-      int t = numGroups - 1;
-      while (t > 0) {
-        bits++;
-        t >>= 1;
-      }
-      for (int i = 0; i <= picSizeInMapUnitsMinus1; i++) {
-        br.readBits(bits); // slice_group_id[i]
-      }
+    switch (sliceGroupMapType) {
+      case 0:
+        for (var i = 0; i <= numSliceGroupsMinus1; i++) {
+          readUE(br); // run_length_minus1[i]
+        }
+        break;
+      case 2:
+        for (var i = 0; i < numSliceGroupsMinus1; i++) {
+          readUE(br); // top_left[i]
+          readUE(br); // bottom_right[i]
+        }
+        break;
+      case 3:
+      case 4:
+      case 5:
+        sliceGroupChangeDirectionFlag = br.readBit() == 1;
+        sliceGroupChangeRateMinus1 = readUE(br);
+        break;
+      case 6:
+        picSizeInMapUnitsMinus1 = readUE(br);
+        final bits = _ceilLog2(numSliceGroupsMinus1 + 1);
+        for (var i = 0; i <= picSizeInMapUnitsMinus1; i++) {
+          br.readBits(bits); // slice_group_id[i]
+        }
+        break;
+      default:
+        throw FormatException(
+          'Invalid slice_group_map_type=$sliceGroupMapType',
+        );
     }
   }
 
-  readUE(br); // num_ref_idx_l0_default_active_minus1
-  readUE(br); // num_ref_idx_l1_default_active_minus1
-  br.readBit(); // weighted_pred_flag
-  br.readBits(2); // weighted_bipred_idc
+  final numRefIdxL0DefaultActiveMinus1 = readUE(br);
+  final numRefIdxL1DefaultActiveMinus1 = readUE(br);
+  final weightedPredFlag = br.readBit() == 1;
+  final weightedBipredIdc = br.readBits(2);
   final picInitQpMinus26 = readSE(br);
-  readSE(br); // pic_init_qs_minus26
+  final picInitQsMinus26 = readSE(br);
   final chromaQpIndexOffset = readSE(br);
   final deblockingFilterControlPresentFlag = br.readBit() == 1;
-  br.readBit(); // constrained_intra_pred_flag
+  final constrainedIntraPredFlag = br.readBit() == 1;
   final redundantPicCntPresentFlag = br.readBit() == 1;
 
-  bool transform8x8ModeFlag = false;
-  if (_hasMoreRbspData(br)) {
+  var transform8x8ModeFlag = false;
+  var picScalingMatrixPresentFlag = false;
+  var secondChromaQpIndexOffset = chromaQpIndexOffset;
+  if (moreRbspData(br)) {
     transform8x8ModeFlag = br.readBit() == 1;
-    final picScalingMatrixPresentFlag = br.readBit();
-    if (picScalingMatrixPresentFlag == 1) {
-      final count = 6 + (transform8x8ModeFlag ? 2 : 0);
-      for (int i = 0; i < count; i++) {
-        final present = br.readBit();
-        if (present == 1) {
-          // skip pic_scaling_list_present_flag list payload (not used here)
+    picScalingMatrixPresentFlag = br.readBit() == 1;
+    if (picScalingMatrixPresentFlag) {
+      final count =
+          6 + (transform8x8ModeFlag ? (chromaFormatIdc == 3 ? 6 : 2) : 0);
+      for (var i = 0; i < count; i++) {
+        if (br.readBit() == 1) {
           _skipScalingList(br, i < 6 ? 16 : 64);
         }
       }
     }
-    readSE(br); // second_chroma_qp_index_offset
+    secondChromaQpIndexOffset = readSE(br);
   }
 
   return PpsInfo(
     ppsId: ppsId,
     spsId: spsId,
     entropyCodingModeFlag: entropyCodingModeFlag,
+    bottomFieldPicOrderInFramePresentFlag:
+        bottomFieldPicOrderInFramePresentFlag,
     numSliceGroupsMinus1: numSliceGroupsMinus1,
     sliceGroupMapType: sliceGroupMapType,
     sliceGroupChangeDirectionFlag: sliceGroupChangeDirectionFlag,
     sliceGroupChangeRateMinus1: sliceGroupChangeRateMinus1,
     picSizeInMapUnitsMinus1: picSizeInMapUnitsMinus1,
+    numRefIdxL0DefaultActiveMinus1: numRefIdxL0DefaultActiveMinus1,
+    numRefIdxL1DefaultActiveMinus1: numRefIdxL1DefaultActiveMinus1,
+    weightedPredFlag: weightedPredFlag,
+    weightedBipredIdc: weightedBipredIdc,
     picInitQpMinus26: picInitQpMinus26,
+    picInitQsMinus26: picInitQsMinus26,
     chromaQpIndexOffset: chromaQpIndexOffset,
-    bottomFieldPicOrderInFramePresentFlag:
-        bottomFieldPicOrderInFramePresentFlag,
     deblockingFilterControlPresentFlag: deblockingFilterControlPresentFlag,
+    constrainedIntraPredFlag: constrainedIntraPredFlag,
     redundantPicCntPresentFlag: redundantPicCntPresentFlag,
     transform8x8ModeFlag: transform8x8ModeFlag,
+    picScalingMatrixPresentFlag: picScalingMatrixPresentFlag,
+    secondChromaQpIndexOffset: secondChromaQpIndexOffset,
   );
 }
 
-bool _hasMoreRbspData(BitReader br) {
-  final pos = br.bitPos;
-  final totalBits = br.data.length * 8;
-  if (pos >= totalBits) return false;
-  int lastOne = -1;
-  for (int i = totalBits - 1; i >= pos; i--) {
-    final byteIndex = i >> 3;
-    final bitInByte = 7 - (i & 7);
-    final b = (br.data[byteIndex] >> bitInByte) & 1;
-    if (b == 1) {
-      lastOne = i;
-      break;
-    }
+int _ceilLog2(int value) {
+  var bits = 0;
+  var capacity = 1;
+  while (capacity < value) {
+    capacity <<= 1;
+    bits++;
   }
-  if (lastOne < 0) return false;
-  return pos < lastOne;
+  return bits;
 }
 
 void _skipScalingList(BitReader br, int size) {
-  int lastScale = 8;
-  int nextScale = 8;
-  for (int j = 0; j < size; j++) {
+  var lastScale = 8;
+  var nextScale = 8;
+  for (var j = 0; j < size; j++) {
     if (nextScale != 0) {
-      final deltaScale = readSE(br);
-      nextScale = (lastScale + deltaScale) & 0xff;
+      nextScale = (lastScale + readSE(br)) & 0xff;
     }
-    lastScale = nextScale == 0 ? lastScale : nextScale;
+    if (nextScale != 0) lastScale = nextScale;
   }
 }

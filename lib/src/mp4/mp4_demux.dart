@@ -1,6 +1,8 @@
 import 'dart:typed_data';
 import 'dart:convert';
 
+import '../audio/aac/audio_specific_config.dart';
+
 class Mp4AvcConfig {
   final int nalLengthSize; // 1,2,4
   final List<Uint8List> sps;
@@ -19,6 +21,9 @@ class Mp4VideoTrack {
   final List<int> sampleSizes;
   final List<int> sampleOffsets; // absolute file offsets per sample
   final List<int> dts; // decode timestamp in track timescale units per sample
+  final List<int> sampleDurations;
+  final List<int> pts; // presentation timestamp (DTS + CTTS offset)
+  final int presentationTimeOffset;
 
   Mp4VideoTrack({
     required this.timescale,
@@ -26,7 +31,59 @@ class Mp4VideoTrack {
     required this.sampleSizes,
     required this.sampleOffsets,
     required this.dts,
+    List<int>? sampleDurations,
+    List<int>? pts,
+    this.presentationTimeOffset = 0,
+  }) : sampleDurations =
+           sampleDurations ??
+           List<int>.filled(sampleSizes.length, 0, growable: false),
+       pts = pts ?? List<int>.unmodifiable(dts);
+}
+
+/// AAC decoder configuration carried by an MP4 `mp4a` sample entry.
+final class Mp4AacConfig {
+  Mp4AacConfig({
+    required this.objectTypeIndication,
+    required this.config,
+    required this.maxBitrate,
+    required this.averageBitrate,
   });
+
+  /// MPEG-4 systems object type. AAC commonly uses 0x40.
+  final int objectTypeIndication;
+  final AudioSpecificConfig config;
+  final int maxBitrate;
+  final int averageBitrate;
+}
+
+/// One AAC audio track and the classic MP4 sample tables needed to extract it.
+final class Mp4AudioTrack {
+  Mp4AudioTrack({
+    required this.timescale,
+    required this.channelCount,
+    required this.sampleSizeBits,
+    required this.sampleRate,
+    required this.aac,
+    required this.sampleSizes,
+    required this.sampleOffsets,
+    required this.dts,
+    required this.sampleDurations,
+    required this.pts,
+    required this.presentationTimeOffset,
+  });
+
+  final int timescale;
+  final int channelCount;
+  final int sampleSizeBits;
+  final int sampleRate;
+  final Mp4AacConfig aac;
+  AudioSpecificConfig get config => aac.config;
+  final List<int> sampleSizes;
+  final List<int> sampleOffsets;
+  final List<int> dts;
+  final List<int> sampleDurations;
+  final List<int> pts;
+  final int presentationTimeOffset;
 }
 
 class Mp4Demux {
@@ -65,72 +122,79 @@ class Mp4Demux {
     if (avcC == null) throw StateError('MP4: avcC not found');
     final avc = _parseAvcC(fileBytes.sublist(avcC.dataStart, avcC.end));
 
-    // Sample tables
-    final stsz = _findBoxDeep(
-      fileBytes,
-      videoTrak.dataStart,
-      videoTrak.end,
-      'stsz',
-    );
-    if (stsz == null) throw StateError('MP4: stsz not found');
-    final sampleSizes = _parseStsz(fileBytes, stsz);
-
-    final stco = _findBoxDeep(
-      fileBytes,
-      videoTrak.dataStart,
-      videoTrak.end,
-      'stco',
-    );
-    final co64 = _findBoxDeep(
-      fileBytes,
-      videoTrak.dataStart,
-      videoTrak.end,
-      'co64',
-    );
-    if (stco == null && co64 == null)
-      throw StateError('MP4: stco/co64 not found');
-    final chunkOffsets = stco != null
-        ? _parseStco(fileBytes, stco)
-        : _parseCo64(fileBytes, co64!);
-
-    final stsc = _findBoxDeep(
-      fileBytes,
-      videoTrak.dataStart,
-      videoTrak.end,
-      'stsc',
-    );
-    if (stsc == null) throw StateError('MP4: stsc not found');
-    final stscEntries = _parseStsc(fileBytes, stsc);
-
-    final stts = _findBoxDeep(
-      fileBytes,
-      videoTrak.dataStart,
-      videoTrak.end,
-      'stts',
-    );
-    if (stts == null) throw StateError('MP4: stts not found');
-    final dts = _buildDtsFromStts(fileBytes, stts, sampleSizes.length);
-
-    // Build sample offsets from chunk layout
-    final sampleOffsets = _buildSampleOffsets(
-      sampleSizes: sampleSizes,
-      chunkOffsets: chunkOffsets,
-      stsc: stscEntries,
-    );
-
-    if (sampleOffsets.length != sampleSizes.length) {
-      throw StateError(
-        'MP4: sampleOffsets mismatch ${sampleOffsets.length} vs ${sampleSizes.length}',
-      );
-    }
+    final table = _parseTrackSampleTable(fileBytes, videoTrak, timescale);
 
     return Mp4VideoTrack(
       timescale: timescale,
       avc: avc,
-      sampleSizes: sampleSizes,
-      sampleOffsets: sampleOffsets,
-      dts: dts,
+      sampleSizes: table.sampleSizes,
+      sampleOffsets: table.sampleOffsets,
+      dts: table.dts,
+      sampleDurations: table.sampleDurations,
+      pts: table.pts,
+      presentationTimeOffset: table.presentationTimeOffset,
     );
+  }
+
+  /// Parses the first MPEG-4 AAC (`soun`/`mp4a`) track, if present.
+  ///
+  /// MP4 stores AAC samples without ADTS headers. [readAudioSample] therefore
+  /// returns one raw AAC access unit configured by [Mp4AudioTrack.config].
+  static Mp4AudioTrack? parseAacTrack(Uint8List fileBytes) {
+    final moov = _findBox(fileBytes, 0, fileBytes.length, 'moov');
+    if (moov == null) throw StateError('MP4: moov not found');
+
+    final traks = _findBoxes(fileBytes, moov.dataStart, moov.end, 'trak');
+    for (final trak in traks) {
+      final handlerType = _trackHandlerType(fileBytes, trak);
+      if (handlerType != null && handlerType != 'soun') continue;
+
+      final entry = _findSampleEntryInTrack(fileBytes, trak, const <String>{
+        'mp4a',
+      });
+      if (entry == null) continue;
+
+      final audioEntry = _parseMp4aSampleEntry(fileBytes, entry);
+      final esds = _findEsdsInAudioSampleEntry(fileBytes, entry);
+      if (esds == null) {
+        throw StateError('MP4: mp4a track has no esds box');
+      }
+      final aac = _parseEsds(fileBytes, esds);
+      final mdhd = _findBoxDeep(fileBytes, trak.dataStart, trak.end, 'mdhd');
+      if (mdhd == null) throw StateError('MP4: audio mdhd not found');
+      final timescale = _parseMdhdTimescale(fileBytes, mdhd);
+      final table = _parseTrackSampleTable(fileBytes, trak, timescale);
+
+      if (audioEntry.sampleRate != aac.config.samplingFrequency) {
+        throw FormatException(
+          'MP4: mp4a sample rate ${audioEntry.sampleRate} disagrees with '
+          'AudioSpecificConfig ${aac.config.samplingFrequency}',
+        );
+      }
+      final configuredChannelCount = aac.config.channelCount;
+      if (configuredChannelCount != null &&
+          audioEntry.channelCount != configuredChannelCount) {
+        throw FormatException(
+          'MP4: mp4a channel count ${audioEntry.channelCount} disagrees with '
+          'AudioSpecificConfig $configuredChannelCount',
+        );
+      }
+
+      return Mp4AudioTrack(
+        timescale: timescale,
+        channelCount: audioEntry.channelCount,
+        sampleSizeBits: audioEntry.sampleSizeBits,
+        sampleRate: audioEntry.sampleRate,
+        aac: aac,
+        sampleSizes: table.sampleSizes,
+        sampleOffsets: table.sampleOffsets,
+        dts: table.dts,
+        sampleDurations: table.sampleDurations,
+        pts: table.pts,
+        presentationTimeOffset: table.presentationTimeOffset,
+      );
+    }
+    return null;
   }
 
   static List<Uint8List> readSampleNalUnits(
@@ -154,6 +218,29 @@ class Mp4Demux {
     }
 
     return out;
+  }
+
+  static Uint8List readAudioSample(
+    Uint8List fileBytes,
+    Mp4AudioTrack track,
+    int sampleIndex,
+  ) {
+    if (sampleIndex < 0 || sampleIndex >= track.sampleSizes.length) {
+      throw RangeError.range(
+        sampleIndex,
+        0,
+        track.sampleSizes.length - 1,
+        'sampleIndex',
+      );
+    }
+    final offset = track.sampleOffsets[sampleIndex];
+    final end = offset + track.sampleSizes[sampleIndex];
+    if (offset < 0 || end < offset || end > fileBytes.length) {
+      throw FormatException(
+        'MP4: audio sample $sampleIndex range $offset..$end is outside file',
+      );
+    }
+    return Uint8List.fromList(fileBytes.sublist(offset, end));
   }
 }
 
@@ -195,6 +282,309 @@ Mp4AvcConfig _parseAvcC(Uint8List avcCData) {
   return Mp4AvcConfig(nalLengthSize: nalLengthSize, sps: sps, pps: pps);
 }
 
+_Mp4SampleTable _parseTrackSampleTable(
+  Uint8List bytes,
+  _Box trak,
+  int trackTimescale,
+) {
+  final stsz = _findBoxDeep(bytes, trak.dataStart, trak.end, 'stsz');
+  if (stsz == null) throw StateError('MP4: stsz not found');
+  final sampleSizes = _parseStsz(bytes, stsz);
+
+  final stco = _findBoxDeep(bytes, trak.dataStart, trak.end, 'stco');
+  final co64 = _findBoxDeep(bytes, trak.dataStart, trak.end, 'co64');
+  if (stco == null && co64 == null) {
+    throw StateError('MP4: stco/co64 not found');
+  }
+  final chunkOffsets = stco != null
+      ? _parseStco(bytes, stco)
+      : _parseCo64(bytes, co64!);
+
+  final stsc = _findBoxDeep(bytes, trak.dataStart, trak.end, 'stsc');
+  if (stsc == null) throw StateError('MP4: stsc not found');
+  final stscEntries = _parseStsc(bytes, stsc);
+  if (sampleSizes.isNotEmpty && stscEntries.isEmpty) {
+    throw const FormatException('MP4: stsc contains no entries');
+  }
+
+  final stts = _findBoxDeep(bytes, trak.dataStart, trak.end, 'stts');
+  if (stts == null) throw StateError('MP4: stts not found');
+  final timing = _parseStts(bytes, stts, sampleSizes.length);
+
+  final sampleOffsets = _buildSampleOffsets(
+    sampleSizes: sampleSizes,
+    chunkOffsets: chunkOffsets,
+    stsc: stscEntries,
+  );
+  if (sampleOffsets.length != sampleSizes.length) {
+    throw StateError(
+      'MP4: sampleOffsets mismatch ${sampleOffsets.length} vs '
+      '${sampleSizes.length}',
+    );
+  }
+  for (var i = 0; i < sampleOffsets.length; i++) {
+    final end = sampleOffsets[i] + sampleSizes[i];
+    if (sampleOffsets[i] < 0 || end < sampleOffsets[i] || end > bytes.length) {
+      throw FormatException(
+        'MP4: sample $i range ${sampleOffsets[i]}..$end is outside file',
+      );
+    }
+  }
+
+  final ctts = _findBoxDeep(bytes, trak.dataStart, trak.end, 'ctts');
+  final compositionOffsets = ctts == null
+      ? List<int>.filled(sampleSizes.length, 0, growable: false)
+      : _parseCtts(bytes, ctts, sampleSizes.length);
+  final presentationTimeOffset = _parseEditListPresentationOffset(
+    bytes,
+    trak,
+    trackTimescale,
+  );
+  final pts = List<int>.generate(
+    sampleSizes.length,
+    (index) =>
+        timing.dts[index] + compositionOffsets[index] + presentationTimeOffset,
+    growable: false,
+  );
+
+  return _Mp4SampleTable(
+    sampleSizes: List<int>.unmodifiable(sampleSizes),
+    sampleOffsets: List<int>.unmodifiable(sampleOffsets),
+    dts: List<int>.unmodifiable(timing.dts),
+    sampleDurations: List<int>.unmodifiable(timing.durations),
+    pts: List<int>.unmodifiable(pts),
+    presentationTimeOffset: presentationTimeOffset,
+  );
+}
+
+int _parseEditListPresentationOffset(
+  Uint8List bytes,
+  _Box trak,
+  int trackTimescale,
+) {
+  final elst = _findBoxDeep(bytes, trak.dataStart, trak.end, 'elst');
+  if (elst == null) return 0;
+  final reader = _ByteReader(bytes, offset: elst.dataStart);
+  final version = reader.readU8();
+  reader.readU24();
+  if (version != 0 && version != 1) {
+    throw FormatException('MP4: unsupported elst version=$version');
+  }
+  final entryCount = reader.readU32();
+  var leadingEmptyDuration = 0;
+
+  for (var index = 0; index < entryCount; index++) {
+    final segmentDuration = version == 1 ? reader.readU64() : reader.readU32();
+    final mediaTime = version == 1 ? reader.readI64() : reader.readI32();
+    final mediaRateInteger = reader.readI16();
+    final mediaRateFraction = reader.readI16();
+    if (mediaRateInteger != 1 || mediaRateFraction != 0) {
+      throw UnsupportedError(
+        'MP4: edit-list media rate $mediaRateInteger.$mediaRateFraction '
+        'is not supported',
+      );
+    }
+    if (mediaTime == -1) {
+      leadingEmptyDuration += segmentDuration;
+      continue;
+    }
+
+    var emptyTrackDuration = 0;
+    if (leadingEmptyDuration != 0) {
+      final mvhd = _findBoxDeep(bytes, 0, bytes.length, 'mvhd');
+      if (mvhd == null) {
+        throw StateError('MP4: mvhd required for an empty edit');
+      }
+      final movieTimescale = _parseMvhdTimescale(bytes, mvhd);
+      emptyTrackDuration =
+          (leadingEmptyDuration * trackTimescale + movieTimescale ~/ 2) ~/
+          movieTimescale;
+    }
+    return emptyTrackDuration - mediaTime;
+  }
+  return 0;
+}
+
+String? _trackHandlerType(Uint8List bytes, _Box trak) {
+  final hdlr = _findBoxDeep(bytes, trak.dataStart, trak.end, 'hdlr');
+  if (hdlr == null || hdlr.end - hdlr.dataStart < 12) return null;
+  final reader = _ByteReader(bytes, offset: hdlr.dataStart);
+  reader.readU32(); // version + flags
+  reader.readU32(); // pre_defined
+  return latin1.decode(reader.readBytes(4));
+}
+
+_SampleEntry? _findSampleEntryInTrack(
+  Uint8List bytes,
+  _Box trak,
+  Set<String> acceptedTypes,
+) {
+  final stsd = _findBoxDeep(bytes, trak.dataStart, trak.end, 'stsd');
+  if (stsd == null || stsd.end - stsd.dataStart < 8) return null;
+  final reader = _ByteReader(bytes, offset: stsd.dataStart);
+  reader.readU32(); // version + flags
+  final entryCount = reader.readU32();
+
+  for (var i = 0; i < entryCount; i++) {
+    if (reader.offset + 8 > stsd.end) {
+      throw const FormatException('MP4: truncated stsd sample entry');
+    }
+    final start = reader.offset;
+    final size = reader.readU32();
+    final type = latin1.decode(reader.readBytes(4));
+    if (size < 8 || start + size > stsd.end) {
+      throw FormatException('MP4: invalid $type sample entry size=$size');
+    }
+    if (acceptedTypes.contains(type)) {
+      return _SampleEntry(start, start + size, type);
+    }
+    reader.offset = start + size;
+  }
+  return null;
+}
+
+_Mp4aSampleEntry _parseMp4aSampleEntry(Uint8List bytes, _SampleEntry entry) {
+  if (entry.end - entry.start < 36) {
+    throw const FormatException('MP4: truncated mp4a AudioSampleEntry');
+  }
+  final reader = _ByteReader(bytes, offset: entry.start + 8);
+  reader.readBytes(6); // reserved
+  reader.readU16(); // data_reference_index
+  final version = reader.readU16();
+  reader.readU16(); // revision_level
+  reader.readU32(); // vendor
+  final channelCount = reader.readU16();
+  final sampleSizeBits = reader.readU16();
+  reader.readU16(); // compression_id
+  reader.readU16(); // packet_size
+  final sampleRateFixed = reader.readU32();
+  final sampleRate = sampleRateFixed >>> 16;
+
+  if (version != 0 && version != 1 && version != 2) {
+    throw FormatException('MP4: unsupported mp4a entry version=$version');
+  }
+  if (version == 1 && reader.offset + 16 > entry.end) {
+    throw const FormatException('MP4: truncated version-1 mp4a extension');
+  }
+  if (version == 2 && reader.offset + 36 > entry.end) {
+    throw const FormatException('MP4: truncated version-2 mp4a extension');
+  }
+  if (channelCount == 0 || sampleRate == 0) {
+    throw FormatException(
+      'MP4: invalid mp4a channelCount=$channelCount sampleRate=$sampleRate',
+    );
+  }
+  return _Mp4aSampleEntry(
+    version: version,
+    channelCount: channelCount,
+    sampleSizeBits: sampleSizeBits,
+    sampleRate: sampleRate,
+  );
+}
+
+_Box? _findEsdsInAudioSampleEntry(Uint8List bytes, _SampleEntry entry) {
+  if (entry.end - entry.start < 36) return null;
+  final version = (bytes[entry.start + 16] << 8) | bytes[entry.start + 17];
+  final childStart = switch (version) {
+    0 => entry.start + 36,
+    1 => entry.start + 52,
+    2 => entry.start + 72,
+    _ => entry.end,
+  };
+  if (childStart > entry.end) return null;
+  return _findBox(bytes, childStart, entry.end, 'esds');
+}
+
+Mp4AacConfig _parseEsds(Uint8List bytes, _Box esds) {
+  if (esds.end - esds.dataStart < 6) {
+    throw const FormatException('MP4: truncated esds box');
+  }
+  final data = bytes.sublist(esds.dataStart + 4, esds.end); // FullBox header
+  var rootOffset = 0;
+  final root = _readDescriptor(data, rootOffset);
+  rootOffset = root.payloadStart;
+
+  _Descriptor decoderConfig;
+  if (root.tag == 0x03) {
+    if (root.payloadLength < 3) {
+      throw const FormatException('MP4: truncated ES_Descriptor');
+    }
+    var childOffset = rootOffset + 2; // ES_ID
+    final flags = data[childOffset++];
+    if ((flags & 0x80) != 0) childOffset += 2; // dependsOn_ES_ID
+    if ((flags & 0x40) != 0) {
+      if (childOffset >= root.payloadEnd) {
+        throw const FormatException('MP4: truncated ES URL flag');
+      }
+      childOffset += 1 + data[childOffset];
+    }
+    if ((flags & 0x20) != 0) childOffset += 2; // OCR_ES_Id
+    if (childOffset >= root.payloadEnd) {
+      throw const FormatException('MP4: missing DecoderConfigDescriptor');
+    }
+    decoderConfig = _readDescriptor(data, childOffset);
+  } else if (root.tag == 0x04) {
+    decoderConfig = root;
+  } else {
+    throw FormatException(
+      'MP4: expected ES/DecoderConfig descriptor, got 0x'
+      '${root.tag.toRadixString(16)}',
+    );
+  }
+
+  if (decoderConfig.tag != 0x04 || decoderConfig.payloadLength < 13) {
+    throw const FormatException('MP4: invalid DecoderConfigDescriptor');
+  }
+  final reader = _ByteReader(data, offset: decoderConfig.payloadStart);
+  final objectTypeIndication = reader.readU8();
+  reader.readU8(); // streamType/upStream/reserved
+  reader.readU24(); // bufferSizeDB
+  final maxBitrate = reader.readU32();
+  final averageBitrate = reader.readU32();
+
+  final specific = _readDescriptor(data, reader.offset);
+  if (specific.tag != 0x05 || specific.payloadLength == 0) {
+    throw const FormatException('MP4: DecoderSpecificInfo (ASC) missing');
+  }
+  final ascBytes = Uint8List.fromList(
+    data.sublist(specific.payloadStart, specific.payloadEnd),
+  );
+  return Mp4AacConfig(
+    objectTypeIndication: objectTypeIndication,
+    config: AudioSpecificConfig.parse(ascBytes),
+    maxBitrate: maxBitrate,
+    averageBitrate: averageBitrate,
+  );
+}
+
+_Descriptor _readDescriptor(Uint8List bytes, int offset) {
+  if (offset < 0 || offset >= bytes.length) {
+    throw const FormatException('MP4: truncated descriptor tag');
+  }
+  final tag = bytes[offset++];
+  var length = 0;
+  var terminated = false;
+  for (var i = 0; i < 4; i++) {
+    if (offset >= bytes.length) {
+      throw const FormatException('MP4: truncated descriptor length');
+    }
+    final value = bytes[offset++];
+    length = (length << 7) | (value & 0x7f);
+    if ((value & 0x80) == 0) {
+      terminated = true;
+      break;
+    }
+  }
+  if (!terminated) {
+    throw const FormatException('MP4: descriptor length exceeds four bytes');
+  }
+  final end = offset + length;
+  if (end < offset || end > bytes.length) {
+    throw const FormatException('MP4: descriptor payload is truncated');
+  }
+  return _Descriptor(tag, offset, end);
+}
+
 int _parseMdhdTimescale(Uint8List bytes, _Box mdhd) {
   final br = _ByteReader(bytes, offset: mdhd.dataStart);
   final version = br.readU8();
@@ -213,6 +603,26 @@ int _parseMdhdTimescale(Uint8List bytes, _Box mdhd) {
   }
 }
 
+int _parseMvhdTimescale(Uint8List bytes, _Box mvhd) {
+  final reader = _ByteReader(bytes, offset: mvhd.dataStart);
+  final version = reader.readU8();
+  reader.readU24();
+  if (version == 1) {
+    reader.readU64();
+    reader.readU64();
+  } else if (version == 0) {
+    reader.readU32();
+    reader.readU32();
+  } else {
+    throw FormatException('MP4: unsupported mvhd version=$version');
+  }
+  final timescale = reader.readU32();
+  if (timescale == 0) {
+    throw const FormatException('MP4: mvhd timescale is zero');
+  }
+  return timescale;
+}
+
 List<int> _parseStsz(Uint8List bytes, _Box stsz) {
   final br = _ByteReader(bytes, offset: stsz.dataStart);
   br.readU8();
@@ -222,9 +632,13 @@ List<int> _parseStsz(Uint8List bytes, _Box stsz) {
 
   final sizes = <int>[];
   if (sampleSize != 0) {
-    for (int i = 0; i < sampleCount; i++) sizes.add(sampleSize);
+    for (int i = 0; i < sampleCount; i++) {
+      sizes.add(sampleSize);
+    }
   } else {
-    for (int i = 0; i < sampleCount; i++) sizes.add(br.readU32());
+    for (int i = 0; i < sampleCount; i++) {
+      sizes.add(br.readU32());
+    }
   }
   return sizes;
 }
@@ -235,7 +649,9 @@ List<int> _parseStco(Uint8List bytes, _Box stco) {
   br.readU24();
   final count = br.readU32();
   final out = <int>[];
-  for (int i = 0; i < count; i++) out.add(br.readU32());
+  for (int i = 0; i < count; i++) {
+    out.add(br.readU32());
+  }
   return out;
 }
 
@@ -245,7 +661,9 @@ List<int> _parseCo64(Uint8List bytes, _Box co64) {
   br.readU24();
   final count = br.readU32();
   final out = <int>[];
-  for (int i = 0; i < count; i++) out.add(br.readU64().toInt());
+  for (int i = 0; i < count; i++) {
+    out.add(br.readU64().toInt());
+  }
   return out;
 }
 
@@ -270,27 +688,72 @@ List<_StscEntry> _parseStsc(Uint8List bytes, _Box stsc) {
   return out;
 }
 
-List<int> _buildDtsFromStts(Uint8List bytes, _Box stts, int sampleCount) {
+({List<int> dts, List<int> durations}) _parseStts(
+  Uint8List bytes,
+  _Box stts,
+  int sampleCount,
+) {
   final br = _ByteReader(bytes, offset: stts.dataStart);
   br.readU8();
   br.readU24();
   final entryCount = br.readU32();
 
   final dts = List<int>.filled(sampleCount, 0);
+  final durations = List<int>.filled(sampleCount, 0);
   int cur = 0;
   int acc = 0;
 
   for (int i = 0; i < entryCount; i++) {
     final count = br.readU32();
     final delta = br.readU32();
-    for (int j = 0; j < count && cur < sampleCount; j++) {
+    if (count > sampleCount - cur) {
+      throw FormatException(
+        'MP4: stts describes more than $sampleCount samples',
+      );
+    }
+    for (int j = 0; j < count; j++) {
       dts[cur] = acc;
+      durations[cur] = delta;
       acc += delta;
       cur++;
     }
   }
-  // If fewer filled, keep last acc stepping not required for our use.
-  return dts;
+  if (cur != sampleCount) {
+    throw FormatException('MP4: stts describes $cur of $sampleCount samples');
+  }
+  return (dts: dts, durations: durations);
+}
+
+List<int> _parseCtts(Uint8List bytes, _Box ctts, int sampleCount) {
+  final br = _ByteReader(bytes, offset: ctts.dataStart);
+  final version = br.readU8();
+  br.readU24();
+  if (version != 0 && version != 1) {
+    throw FormatException('MP4: unsupported ctts version=$version');
+  }
+  final entryCount = br.readU32();
+  final offsets = List<int>.filled(sampleCount, 0);
+  var cursor = 0;
+  for (var i = 0; i < entryCount; i++) {
+    final count = br.readU32();
+    final encodedOffset = br.readU32();
+    final offset = version == 1 && (encodedOffset & 0x80000000) != 0
+        ? encodedOffset - 0x100000000
+        : encodedOffset;
+    if (count > sampleCount - cursor) {
+      throw FormatException(
+        'MP4: ctts describes more than $sampleCount samples',
+      );
+    }
+    offsets.fillRange(cursor, cursor + count, offset);
+    cursor += count;
+  }
+  if (cursor != sampleCount) {
+    throw FormatException(
+      'MP4: ctts describes $cursor of $sampleCount samples',
+    );
+  }
+  return offsets;
 }
 
 List<int> _buildSampleOffsets({
@@ -322,6 +785,55 @@ List<int> _buildSampleOffsets({
   }
 
   return out;
+}
+
+final class _Mp4SampleTable {
+  const _Mp4SampleTable({
+    required this.sampleSizes,
+    required this.sampleOffsets,
+    required this.dts,
+    required this.sampleDurations,
+    required this.pts,
+    required this.presentationTimeOffset,
+  });
+
+  final List<int> sampleSizes;
+  final List<int> sampleOffsets;
+  final List<int> dts;
+  final List<int> sampleDurations;
+  final List<int> pts;
+  final int presentationTimeOffset;
+}
+
+final class _SampleEntry {
+  const _SampleEntry(this.start, this.end, this.type);
+
+  final int start;
+  final int end;
+  final String type;
+}
+
+final class _Mp4aSampleEntry {
+  const _Mp4aSampleEntry({
+    required this.version,
+    required this.channelCount,
+    required this.sampleSizeBits,
+    required this.sampleRate,
+  });
+
+  final int version;
+  final int channelCount;
+  final int sampleSizeBits;
+  final int sampleRate;
+}
+
+final class _Descriptor {
+  const _Descriptor(this.tag, this.payloadStart, this.payloadEnd);
+
+  final int tag;
+  final int payloadStart;
+  final int payloadEnd;
+  int get payloadLength => payloadEnd - payloadStart;
 }
 
 class _Box {
@@ -490,6 +1002,11 @@ class _ByteReader {
     return v;
   }
 
+  int readI16() {
+    final value = readU16();
+    return (value & 0x8000) == 0 ? value : value - 0x10000;
+  }
+
   int readU24() {
     final v = (b[offset] << 16) | (b[offset + 1] << 8) | b[offset + 2];
     offset += 3;
@@ -506,10 +1023,22 @@ class _ByteReader {
     return v >>> 0;
   }
 
+  int readI32() {
+    final value = readU32();
+    return (value & 0x80000000) == 0 ? value : value - 0x100000000;
+  }
+
   int readU64() {
     final hi = readU32();
     final lo = readU32();
     return (hi * 4294967296) + lo;
+  }
+
+  int readI64() {
+    final high = readU32();
+    final low = readU32();
+    final signedHigh = (high & 0x80000000) == 0 ? high : high - 0x100000000;
+    return signedHigh * 4294967296 + low;
   }
 
   List<int> readBytes(int n) {

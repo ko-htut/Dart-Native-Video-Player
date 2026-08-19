@@ -5,6 +5,12 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'package:ndvy_player/pure_frame_view.dart';
 import 'package:ndvy_player/src/mp4/mp4_demux.dart';
 
+import 'src/audio/aac/adts.dart';
+import 'src/audio/aac/ts_aac_demux.dart';
+import 'src/audio/audio_decode_pipeline.dart';
+import 'src/audio/audio_playback_controller.dart';
+import 'src/audio/pcm_sink.dart';
+import 'src/audio/pcm_timeline.dart';
 import 'src/hls.dart';
 import 'src/ts_packets.dart';
 import 'src/ts_psi.dart';
@@ -20,7 +26,6 @@ import 'src/decoder/bitreader.dart';
 import 'src/decoder/exp_golomb.dart';
 import 'src/decoder/rbsp.dart';
 import 'src/h264_nal.dart';
-import 'dart:ui' as ui;
 
 class _VariantProbeResult {
   final bool ok;
@@ -36,131 +41,127 @@ class PureDartPlaybackScreen extends StatefulWidget {
 
 class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
   final urlCtrl = TextEditingController(
-    // text: 'https://filesamples.com/samples/video/mp4/sample_640x360.mp4',
-    // HLS example:
-    text: 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8',
-
-    // text: 'https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_ts/master.m3u8',
+    // --- MP4 (use "Build Queue (MP4)" button) ---
+    // text: 'assets/butterfly_dart.mp4',
     // text: 'https://flutter.github.io/assets-for-api-docs/assets/videos/bee.mp4',
-    // text:'https://sfux-ext.sfux.info/hls/chapter/105/1588724110/1588724110.m3u8',
+    // text: 'https://filesamples.com/samples/video/mp4/sample_640x360.mp4',
+
+    // --- HLS (use "Build Queue (HLS/TS)" button) ---
+    text: 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8',
+    // text: 'https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_ts/master.m3u8',
+    // text: 'https://sfux-ext.sfux.info/hls/chapter/105/1588724110/1588724110.m3u8',
   );
 
   bool loading = false;
   String log = '';
-  bool _idrOnly = true; // Step 2 default
 
   final clock = PlayerClock();
   List<TimestampedAccessUnit> queue = [];
   TimestampedAccessUnit? current;
-  int _nextAuIndex = 0;
-  int _lastUiUpdateMs = 0;
 
-  final decoder = H264IdrDecoder();
-  ui.Image? currentImage;
+  final decoder = H264BaselineDecoder();
+  late final SequentialDecodePump<TimestampedAccessUnit, Yuv420Frame>
+  _decodePump;
   String decodeInfo = '';
-  bool _decoding = false;
+  String audioInfo = 'Audio: none';
+
+  AudioPlaybackController? _audioController;
+  StreamSubscription<AudioPlaybackEvent>? _audioEvents;
+  Future<void> _transportTail = Future<void>.value();
 
   Uint8List? _currentRgba;
   int _frameWidth = 0;
   int _frameHeight = 0;
 
-  void append(String s) => setState(() => log = '$log$s\n');
+  void append(String s) {
+    if (!mounted) return;
+    setState(() => log = '$log$s\n');
+  }
+
+  /// Serializes play/pause/seek so a quick second tap cannot overtake an
+  /// in-flight platform-sink command.
+  Future<void> _serializeTransport(Future<void> Function() operation) {
+    final previous = _transportTail;
+    final next = () async {
+      try {
+        await previous;
+      } catch (_) {
+        // A failed transport command must not poison every later command.
+      }
+      await operation();
+    }();
+    _transportTail = next.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return next;
+  }
 
   @override
   void initState() {
     super.initState();
+    _decodePump = SequentialDecodePump<TimestampedAccessUnit, Yuv420Frame>(
+      timestampOf: (au) => au.ptsMs,
+      decode: (au) => decoder.decodeAccessUnitOrThrow(au.nals),
+      onLatestDecoded: _presentDecodedFrame,
+      onDecodeError: _handleDecodeError,
+      onQueueDrained: _handleQueueDrained,
+    );
+    clock.onFrameDue = _decodePump.requestThrough;
+  }
 
-    clock.onFrameDue = (t) async {
-      bool changed = false;
-      while (_nextAuIndex < queue.length && queue[_nextAuIndex].ptsMs <= t) {
-        current = queue[_nextAuIndex];
-        _nextAuIndex++;
-        changed = true;
-      }
-      if (!changed || current == null) {
-        if (t - _lastUiUpdateMs >= 100 && mounted) {
-          _lastUiUpdateMs = t;
-          setState(() {});
-        }
-        return;
-      }
+  void _presentDecodedFrame(TimestampedAccessUnit au, Yuv420Frame frame) {
+    final rgba = yuv420ToRgba(frame);
+    final stats = decoder.lastStats;
+    debugPrint(
+      'Frame ${stats?.frameNumber ?? "?"}: ${frame.width}x${frame.height} '
+      '${stats?.sliceType.name ?? "?"} rgba=${rgba.length}',
+    );
 
-      if (_decoding) return;
-      _decoding = true;
+    if (!mounted) return;
+    setState(() {
+      current = au;
+      _currentRgba = rgba;
+      _frameWidth = frame.width;
+      _frameHeight = frame.height;
+      decodeInfo =
+          'Decoded ${stats?.sliceType.name.toUpperCase() ?? "frame"}: '
+          '${frame.width}x${frame.height}';
+    });
+  }
 
-      try {
-        final au = current!;
-        if (_idrOnly && !au.hasIdr) return;
-        Yuv420Frame? frame;
+  void _handleDecodeError(
+    TimestampedAccessUnit au,
+    Object error,
+    StackTrace stackTrace,
+  ) {
+    clock.pause();
+    final audio = _audioController;
+    if (audio != null) unawaited(audio.pause());
+    debugPrint('decodeAccessUnit error at ${au.ptsMs}ms: $error\n$stackTrace');
+    if (!mounted) return;
+    setState(() {
+      decodeInfo = 'Decoder stopped at ${au.ptsMs}ms: $error';
+    });
+  }
 
-        try {
-          frame = decoder.decodeIdrAccessUnit(au.nals);
-        } catch (e, st) {
-          debugPrint('decodeIdrAccessUnit error: $e\n$st');
-          if (!mounted) return;
-          setState(() {
-            decodeInfo = 'Decoder error at ${au.ptsMs}ms: $e';
-            _currentRgba = null;
-            _frameWidth = 0;
-            _frameHeight = 0;
-            currentImage = null;
-          });
-          return;
-        }
-
-        if (frame == null) {
-          if (!mounted) return;
-          setState(() {
-            decodeInfo = 'Decode null: ${decoder.lastError ?? "unknown"}';
-            _currentRgba = null;
-            _frameWidth = 0;
-            _frameHeight = 0;
-            currentImage = null;
-          });
-          return;
-        }
-
-        final rgba = yuv420ToRgba(frame);
-
-        debugPrint("Frame: ${frame.width}x${frame.height} rgba=${rgba.length}");
-        int sum = 0, mn = 255, mx = 0;
-        for (final p in frame.y) {
-          sum += p;
-          if (p < mn) mn = p;
-          if (p > mx) mx = p;
-        }
-        debugPrint("Y avg=${sum ~/ frame.y.length} min=$mn max=$mx");
-
-        if (!mounted) return;
-        setState(() {
-          _currentRgba = rgba;
-          _frameWidth = frame!.width;
-          _frameHeight = frame.height;
-          decodeInfo = decoder.lastError == null
-              ? 'Decoded: ${frame.width}x${frame.height}'
-              : 'Decoded: ${frame.width}x${frame.height} (${decoder.lastError})';
-          currentImage = null;
-        });
-      } catch (e, st) {
-        debugPrint('onFrameDue error: $e\n$st');
-        if (!mounted) return;
-        setState(() {
-          decodeInfo = 'Playback error: $e';
-          _currentRgba = null;
-          _frameWidth = 0;
-          _frameHeight = 0;
-          currentImage = null;
-        });
-      } finally {
-        _decoding = false;
-      }
-    };
+  void _handleQueueDrained() {
+    final audioStillPlaying = _audioController?.isPlaying ?? false;
+    if (!audioStillPlaying) clock.pause();
+    if (!mounted) return;
+    setState(() {
+      decodeInfo = audioStillPlaying
+          ? 'Video complete — audio finishing…'
+          : 'Playback complete — press Play to replay';
+    });
   }
 
   @override
   void dispose() {
     urlCtrl.dispose();
     clock.dispose();
+    _decodePump.dispose();
+    unawaited(_disposeAudio());
     super.dispose();
   }
 
@@ -171,9 +172,116 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
     return '${m.toString().padLeft(2, '0')}:${r.toString().padLeft(2, '0')}';
   }
 
+  Future<void> _beginQueueBuild() async {
+    setState(() {
+      loading = true;
+      log = '';
+      queue = [];
+      current = null;
+      decodeInfo = 'Building playback queue…';
+      audioInfo = 'Audio: probing…';
+      _currentRgba = null;
+      _frameWidth = 0;
+      _frameHeight = 0;
+    });
+    await _serializeTransport(() async {
+      clock.pause();
+      final audio = _audioController;
+      if (audio != null && audio.isPlaying) await audio.pause();
+      await _disposeAudio();
+      decoder.reset();
+      _decodePump.replaceQueue(const []);
+    });
+  }
+
+  void _installQueue(List<TimestampedAccessUnit> accessUnits) {
+    clock.pause();
+    decoder.reset();
+    queue = List<TimestampedAccessUnit>.unmodifiable(accessUnits);
+    _decodePump.replaceQueue(queue);
+    current = null;
+    decodeInfo = queue.isEmpty
+        ? 'No access units found'
+        : 'Ready — ${queue.length} access units';
+    _currentRgba = null;
+    _frameWidth = 0;
+    _frameHeight = 0;
+  }
+
   Future<Uint8List> loadAssetBytes(String path) async {
     final bd = await rootBundle.load(path);
     return bd.buffer.asUint8List();
+  }
+
+  Future<void> _installAudioTimeline(PcmAudioTimeline timeline) async {
+    await _disposeAudio();
+    final sink = await createNativePcmAudioSink();
+    final controller = AudioPlaybackController(sink);
+    final events = controller.events.listen(_handleAudioEvent);
+    try {
+      await controller.load(timeline);
+    } catch (_) {
+      await events.cancel();
+      await controller.dispose();
+      rethrow;
+    }
+    if (!mounted) {
+      await events.cancel();
+      await controller.dispose();
+      return;
+    }
+    _audioController = controller;
+    _audioEvents = events;
+    setState(() {
+      audioInfo =
+          'Audio: AAC-LC ${timeline.sampleRate} Hz, '
+          '${timeline.channels == 1 ? "mono" : "stereo"}, '
+          '${_fmtMs(timeline.durationUs ~/ 1000)}';
+    });
+  }
+
+  Future<void> _disposeAudio() async {
+    final events = _audioEvents;
+    final controller = _audioController;
+    _audioEvents = null;
+    _audioController = null;
+    if (events != null) await events.cancel();
+    if (controller != null) await controller.dispose();
+  }
+
+  void _handleAudioEvent(AudioPlaybackEvent event) {
+    if (!mounted) return;
+    switch (event.type) {
+      case AudioPlaybackEventType.complete:
+        final videoComplete = _decodePump.nextIndex >= queue.length;
+        if (videoComplete) {
+          clock.pause();
+          setState(() {
+            decodeInfo = 'Playback complete — press Play to replay';
+          });
+        } else {
+          // Audio is normally the master clock. If a valid file has a shorter
+          // audio edit than video edit, finish the remaining pictures against
+          // a wall clock instead of freezing on the last PCM frame.
+          final endMs = event.mediaTimeUs ~/ 1000;
+          clock.play(fromMs: endMs);
+          setState(() {
+            decodeInfo = 'Audio complete — video finishing…';
+          });
+        }
+      case AudioPlaybackEventType.underrun:
+        setState(() {
+          audioInfo = 'Audio underrun: ${event.message ?? "buffer starved"}';
+        });
+      case AudioPlaybackEventType.error:
+        clock.pause();
+        setState(() {
+          audioInfo = 'Audio stopped: ${event.message ?? "unknown error"}';
+        });
+      case AudioPlaybackEventType.ready:
+      case AudioPlaybackEventType.position:
+        break;
+    }
   }
 
   Future<_VariantProbeResult> _probeVariantCompatibility(Uri mediaUri) async {
@@ -187,7 +295,6 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
       final spsById = <int, SpsInfo>{};
       final usedPpsIds = <int>{};
       int idrSliceCount = 0;
-      bool hasT8x8 = false;
 
       final probeSegCount = media.segments.length < 2
           ? media.segments.length
@@ -245,8 +352,9 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         }
       }
 
-      if (ppsById.isEmpty)
+      if (ppsById.isEmpty) {
         return const _VariantProbeResult(false, 'incompatible: PPS missing');
+      }
 
       final idsToCheck = usedPpsIds.isNotEmpty
           ? usedPpsIds
@@ -271,28 +379,27 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
             'incompatible: slice_groups=${pps.numSliceGroupsMinus1} (ppsId=$ppsId)',
           );
         }
-        if (pps.transform8x8ModeFlag) hasT8x8 = true;
-
-        final sps = spsById[pps.spsId];
-        if (sps != null && !sps.frameMbsOnlyFlag) {
+        if (pps.transform8x8ModeFlag || pps.picScalingMatrixPresentFlag) {
           return _VariantProbeResult(
             false,
-            'incompatible: field-coded SPS (spsId=${pps.spsId})',
+            'incompatible: 8x8 transform/scaling matrix (ppsId=$ppsId)',
+          );
+        }
+
+        final sps = spsById[pps.spsId];
+        if (sps != null && !sps.isSupportedBaseline420) {
+          return _VariantProbeResult(
+            false,
+            'incompatible: unsupported profile/chroma/bit-depth '
+            '(spsId=${pps.spsId}, profile=${sps.profileIdc})',
           );
         }
       }
 
       if (idrSliceCount == 0) {
-        return hasT8x8
-            ? const _VariantProbeResult(
-                true,
-                'compatible (no IDR in probe, t8x8=true warning)',
-              )
-            : const _VariantProbeResult(true, 'compatible (no IDR in probe)');
+        return const _VariantProbeResult(true, 'compatible (no IDR in probe)');
       }
-      return hasT8x8
-          ? const _VariantProbeResult(true, 'compatible (t8x8=true warning)')
-          : const _VariantProbeResult(true, 'compatible');
+      return const _VariantProbeResult(true, 'compatible');
     } catch (e) {
       return _VariantProbeResult(false, 'incompatible: probe error ($e)');
     }
@@ -314,14 +421,7 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
   }
 
   Future<void> buildQueue() async {
-    setState(() {
-      loading = true;
-      log = '';
-      queue = [];
-      current = null;
-      _nextAuIndex = 0;
-      _lastUiUpdateMs = 0;
-    });
+    await _beginQueueBuild();
 
     try {
       final url = Uri.parse(urlCtrl.text.trim());
@@ -329,6 +429,9 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
 
       final kind = await detectPlaylistKind(url);
       HlsMediaPlaylist media;
+      HlsMediaPlaylist? separateAudioMedia;
+      var primaryUsesUnsupportedHeAac = false;
+      String? unsupportedAudioReason;
 
       if (kind == HlsPlaylistKind.master) {
         final vars = await fetchHlsVariants(url);
@@ -365,6 +468,38 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
           'Pick variant: ${pick.resolution ?? "?"} bw=${pick.bandwidth ?? 0} codecs=${pick.codecs ?? "?"}',
         );
         media = await fetchMediaPlaylist(pick.uri);
+        primaryUsesUnsupportedHeAac =
+            hlsVariantAdvertisesHeAac(pick) && !hlsVariantAdvertisesAacLc(pick);
+
+        final audioPick = selectHlsAacLcVariant(vars, preferred: pick);
+        if (audioPick != null && audioPick.uri != pick.uri) {
+          append(
+            'Pick AAC-LC audio rendition: ${audioPick.resolution ?? "?"} '
+            'bw=${audioPick.bandwidth ?? 0} codecs=${audioPick.codecs ?? "?"}',
+          );
+          try {
+            separateAudioMedia = await fetchMediaPlaylist(audioPick.uri);
+          } catch (error) {
+            if (primaryUsesUnsupportedHeAac) {
+              unsupportedAudioReason =
+                  'Audio unavailable: selected HLS rendition uses HE-AAC '
+                  'and its AAC-LC fallback playlist could not be loaded '
+                  '($error).';
+              append(unsupportedAudioReason);
+            } else {
+              append(
+                'AAC-LC fallback playlist could not be loaded ($error); '
+                'trying primary rendition audio.',
+              );
+            }
+          }
+        } else if (audioPick == null && primaryUsesUnsupportedHeAac) {
+          unsupportedAudioReason =
+              'Audio unavailable: selected HLS rendition advertises HE-AAC, '
+              'but the Dart decoder supports AAC-LC only and this master '
+              'has no AAC-LC fallback rendition.';
+          append(unsupportedAudioReason);
+        }
       } else {
         final probe = await _probeVariantCompatibility(url);
         append('Probe media: ${probe.reason}');
@@ -384,12 +519,107 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
       final int segLimit = media.segments.length < maxSegments
           ? media.segments.length
           : maxSegments;
+      if (media.isEndList && segLimit < media.segments.length) {
+        final windowDurationMs =
+            (media.segments
+                        .take(segLimit)
+                        .fold<double>(
+                          0,
+                          (sum, segment) => sum + segment.duration,
+                        ) *
+                    1000)
+                .round();
+        append(
+          'VOD safety window: loading first $segLimit/'
+          '${media.segments.length} segments (${_fmtMs(windowDurationMs)}); '
+          '${media.segments.length - segLimit} later segments are not queued.',
+        );
+      }
+      List<HlsSegmentPair>? separateAudioPairs;
+      var usePrimaryAudio =
+          separateAudioMedia == null && !primaryUsesUnsupportedHeAac;
+      if (separateAudioMedia != null) {
+        try {
+          separateAudioPairs = pairHlsVariantSegments(
+            media,
+            separateAudioMedia,
+            limit: segLimit,
+          );
+          append(
+            'Using synchronized component renditions: '
+            '${separateAudioPairs.length} video/audio segment pairs',
+          );
+        } catch (error) {
+          append('AAC-LC rendition rejected: $error');
+          if (primaryUsesUnsupportedHeAac) {
+            unsupportedAudioReason =
+                'Audio unavailable: selected HLS video rendition uses '
+                'unsupported HE-AAC and its AAC-LC fallback is not '
+                'synchronized ($error).';
+            append(unsupportedAudioReason);
+          } else {
+            // CODECS can be absent or incomplete. If the primary rendition is
+            // not explicitly HE-AAC, retain the existing demux-and-validate
+            // path rather than silently discarding a potentially valid track.
+            usePrimaryAudio = true;
+            append(
+              'Falling back to the primary rendition audio because it is not '
+              'advertised as HE-AAC.',
+            );
+          }
+        }
+      }
 
       final allPtsChunks = <PtsChunk>[];
+      final allAudioAccessUnits = <AacAccessUnit>[];
       int? basePts90k;
       BytesBuilder? pendingPes;
       int? cachedPmtPid;
       int? cachedVideoPid;
+      int? cachedAudioPmtPid;
+      TsAacDemuxer? audioDemuxer;
+      String? audioDemuxWarning;
+
+      void finishAudioDemuxer(
+        TsAacDemuxer demuxer, {
+        required String warningPrefix,
+      }) {
+        try {
+          allAudioAccessUnits.addAll(demuxer.finish());
+        } catch (error) {
+          // HLS segment selection can intentionally end between PES/ADTS
+          // boundaries. Audio is optional here: retain access units that were
+          // already completed and never discard the valid video queue.
+          audioDemuxWarning = '$warningPrefix: $error';
+          append(audioDemuxWarning!);
+        }
+      }
+
+      void ingestAudioPackets(List<TsPacket> packets) {
+        final pat = TsPat.find(packets);
+        if (pat != null && pat.programs.isNotEmpty) {
+          cachedAudioPmtPid = pat.programs.values.first;
+        }
+        final pmtPid = cachedAudioPmtPid;
+        if (pmtPid == null) return;
+        final pmt = TsPmt.find(packets, pmtPid);
+        final audioStream = pmt == null ? null : findAdtsAacStream(pmt);
+        if (audioStream != null && audioDemuxer?.pid != audioStream.pid) {
+          final previousDemuxer = audioDemuxer;
+          if (previousDemuxer != null) {
+            finishAudioDemuxer(
+              previousDemuxer,
+              warningPrefix: 'AAC PID change dropped a partial frame',
+            );
+          }
+          audioDemuxer = TsAacDemuxer(pid: audioStream.pid);
+          append('  AAC PID=${audioStream.pid}');
+        }
+        final activeDemuxer = audioDemuxer;
+        if (activeDemuxer != null) {
+          allAudioAccessUnits.addAll(activeDemuxer.pushPackets(packets));
+        }
+      }
 
       for (int s = 0; s < segLimit; s++) {
         final seg = media.segments[s];
@@ -400,8 +630,9 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         final packets = parseTsPackets(tsBytes).toList();
 
         final pat = TsPat.find(packets);
-        if (pat != null && pat.programs.isNotEmpty)
+        if (pat != null && pat.programs.isNotEmpty) {
           cachedPmtPid = pat.programs.values.first;
+        }
         if (cachedPmtPid == null) {
           append('  PAT missing (no cached PMT PID)');
           continue;
@@ -420,6 +651,8 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
           continue;
         }
         final videoPid = cachedVideoPid;
+
+        if (usePrimaryAudio) ingestAudioPackets(packets);
 
         int pesCompleted = 0;
         for (final pkt in packets) {
@@ -453,18 +686,121 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         append('  PES completed=$pesCompleted');
       }
 
-      final out = buildTimestampedIdrAusFromPtsChunks(
+      final audioPairs = separateAudioPairs;
+      if (audioPairs != null) {
+        for (var index = 0; index < audioPairs.length; index++) {
+          final pair = audioPairs[index];
+          append(
+            'AUDIO SEG $index seq=${pair.audio.sequence} '
+            'dur=${pair.audio.duration.toStringAsFixed(2)}',
+          );
+          final bytes = await fetchBytes(pair.audio.uri);
+          ingestAudioPackets(parseTsPackets(bytes).toList());
+        }
+      }
+
+      if (pendingPes != null) {
+        final parsed = parsePes(pendingPes.toBytes());
+        if (parsed != null) {
+          if (parsed.pts90k != null) basePts90k ??= parsed.pts90k;
+          allPtsChunks.add(
+            PtsChunk(pts90k: parsed.pts90k, payload: parsed.esPayload),
+          );
+        }
+      }
+
+      final activeAudioDemuxer = audioDemuxer;
+      if (activeAudioDemuxer != null) {
+        finishAudioDemuxer(
+          activeAudioDemuxer,
+          warningPrefix: 'AAC tail dropped at segment boundary',
+        );
+      }
+
+      if (audioPairs != null) {
+        final videoPts90k = basePts90k;
+        final audioPts90k = allAudioAccessUnits.isEmpty
+            ? null
+            : allAudioAccessUnits.first.pts90k;
+        if (videoPts90k == null || audioPts90k == null) {
+          unsupportedAudioReason =
+              'Audio unavailable: synchronized AAC-LC fallback has no '
+              'verifiable first MPEG PTS (video=$videoPts90k, '
+              'audio=$audioPts90k).';
+          allAudioAccessUnits.clear();
+          append(unsupportedAudioReason);
+        } else {
+          try {
+            final delta90k = validateHlsFirstPtsAlignment(
+              videoPts90k: videoPts90k,
+              audioPts90k: audioPts90k,
+            );
+            append(
+              'Component PTS aligned: audio-video delta '
+              '${(delta90k * 1000 / 90000).toStringAsFixed(3)}ms',
+            );
+          } catch (error) {
+            unsupportedAudioReason =
+                'Audio unavailable: AAC-LC fallback is not synchronized '
+                'with the selected video ($error).';
+            allAudioAccessUnits.clear();
+            append(unsupportedAudioReason);
+          }
+        }
+      }
+
+      final out = buildTimestampedAccessUnitsFromPtsChunks(
         ptsChunks: allPtsChunks,
         basePts90k: basePts90k,
       );
 
-      out.sort((a, b) => a.ptsMs.compareTo(b.ptsMs));
-      queue = _ensureAuHasCachedParamSets(out);
+      // The builder returns elementary-stream decode order. Do not sort equal
+      // or interpolated PTS values: reference pictures must stay in bitstream
+      // order even when several access units share a presentation timestamp.
+      final firstIdr = out.indexWhere((au) => au.hasIdr);
+      if (firstIdr < 0) {
+        append('No random-access picture found in downloaded segments.');
+        return;
+      }
+      if (firstIdr > 0) {
+        append('Dropped $firstIdr leading dependent access units.');
+      }
+      _installQueue(out.sublist(firstIdr));
 
-      _nextAuIndex = 0;
-      _lastUiUpdateMs = 0;
+      if (allAudioAccessUnits.isNotEmpty) {
+        final originPts90k =
+            basePts90k ?? allAudioAccessUnits.first.pts90k ?? 0;
+        append(
+          'Decoding ${allAudioAccessUnits.length} AAC access units in Dart…',
+        );
+        try {
+          final audioAccessUnits = List<AacAccessUnit>.unmodifiable(
+            allAudioAccessUnits,
+          );
+          final timeline = await decodeTransportAacToPcmInBackground(
+            audioAccessUnits,
+            originPts90k: originPts90k,
+          );
+          await _installAudioTimeline(timeline);
+          append(
+            'Audio ready: ${timeline.sampleRate} Hz, '
+            '${timeline.channels} channel(s)',
+          );
+        } catch (error) {
+          audioInfo = 'Audio unavailable: $error';
+          append(audioInfo);
+        }
+      } else {
+        audioInfo =
+            unsupportedAudioReason ??
+            (audioDemuxWarning != null
+                ? 'Audio unavailable: incomplete AAC tail'
+                : audioDemuxer == null
+                ? 'Audio: no muxed ADTS AAC track'
+                : 'Audio: AAC track contained no complete frames');
+      }
 
-      append('\nQueue built: ${queue.length} frames (IDR-only)');
+      append('\nHLS queue built: ${queue.length} access units');
       if (queue.isNotEmpty) {
         append(
           'First PTS=${queue.first.ptsMs}ms Last PTS=${queue.last.ptsMs}ms',
@@ -475,77 +811,52 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
     } catch (e) {
       append('ERROR: $e');
     } finally {
-      setState(() => loading = false);
+      if (mounted) setState(() => loading = false);
     }
-  }
-
-  List<TimestampedAccessUnit> _ensureAuHasCachedParamSets(
-    List<TimestampedAccessUnit> input,
-  ) {
-    Uint8List? cachedSps;
-    Uint8List? cachedPps;
-    final out = <TimestampedAccessUnit>[];
-
-    for (final au in input) {
-      bool hasSps = false;
-      bool hasPps = false;
-      for (final nal in au.nals) {
-        if (nal.isEmpty) continue;
-        final t = nal[0] & 0x1F;
-        if (t == 7) {
-          cachedSps = nal;
-          hasSps = true;
-        } else if (t == 8) {
-          cachedPps = nal;
-          hasPps = true;
-        }
-      }
-
-      final fixedNals = <Uint8List>[];
-      if (!hasSps && cachedSps != null) fixedNals.add(cachedSps);
-      if (!hasPps && cachedPps != null) fixedNals.add(cachedPps);
-      fixedNals.addAll(au.nals);
-
-      out.add(
-        TimestampedAccessUnit(
-          ptsMs: au.ptsMs,
-          nals: fixedNals,
-          hasIdr: au.hasIdr,
-        ),
-      );
-    }
-    return out;
   }
 
   Future<void> buildQueueFromMp4(Uri mp4Url) async {
-    setState(() {
-      loading = true;
-      log = '';
-      queue = [];
-      current = null;
-      _nextAuIndex = 0;
-      _lastUiUpdateMs = 0;
-    });
+    await _beginQueueBuild();
 
     try {
       append("Load MP4: $mp4Url");
       Uint8List bytes;
-      try {
-        final assetBytes = await loadAssetBytes('assets/baby.mp4');
-        if (assetBytes.length > 32) {
-          bytes = assetBytes;
-          append("Using MP4 asset: assets/baby.mp4 bytes=${bytes.length}");
-        } else {
-          append(
-            "Asset assets/baby.mp4 is empty/invalid (bytes=${assetBytes.length}), fallback to URL",
-          );
-          bytes = await fetchBytes(mp4Url);
-          append("Loaded MP4 from URL bytes=${bytes.length}");
-        }
-      } catch (e) {
-        append("Asset load failed ($e), fallback to URL");
+
+      // URL routing:
+      //  1. "assets/..." or "asset:///..." → Flutter asset bundle
+      //  2. http(s) URL ending in .mp4     → fetch from network
+      //  3. Anything else (e.g. HLS .m3u8) → bundled A/V demo asset
+      final urlStr = mp4Url.toString().trim();
+      final isAssetUrl =
+          urlStr.startsWith('assets/') ||
+          urlStr.startsWith('asset:///') ||
+          mp4Url.scheme == 'asset';
+      final isNetworkMp4 =
+          (mp4Url.scheme == 'http' || mp4Url.scheme == 'https') &&
+          urlStr.toLowerCase().endsWith('.mp4');
+
+      if (isAssetUrl) {
+        final assetPath = urlStr.replaceFirst(RegExp(r'^asset:///'), '');
+        bytes = await loadAssetBytes(assetPath);
+        append("Using asset: $assetPath (${bytes.length} bytes)");
+      } else if (isNetworkMp4) {
+        append("Fetching MP4 from network…");
         bytes = await fetchBytes(mp4Url);
-        append("Loaded MP4 from URL bytes=${bytes.length}");
+        append("Loaded ${bytes.length} bytes from URL");
+      } else {
+        // URL is not an MP4 (e.g. the HLS .m3u8 default) — use bundled asset.
+        const fallback = 'assets/butterfly_dart.mp4';
+        try {
+          bytes = await loadAssetBytes(fallback);
+          append(
+            "URL is not MP4. Using bundled $fallback (${bytes.length} bytes)",
+          );
+        } catch (e) {
+          throw Exception(
+            'No bundled asset and URL "$urlStr" is not an .mp4. '
+            'Enter an MP4 URL or "assets/butterfly_dart.mp4" to use this button.',
+          );
+        }
       }
 
       final track = Mp4Demux.parseH264Track(bytes);
@@ -602,28 +913,68 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         }
         nals.addAll(sampleNals);
 
-        final dts = track.dts[i];
-        final ptsMs = (dts * 1000 ~/ track.timescale);
+        final pts = track.pts[i];
+        final ptsMs = (pts * 1000 ~/ track.timescale);
 
         out.add(
           TimestampedAccessUnit(ptsMs: ptsMs, nals: nals, hasIdr: hasIdr),
         );
       }
 
-      if (_idrOnly) {
-        out.removeWhere((au) => !au.hasIdr);
-      }
       append("MP4 samples with IDR: $idrSamples/${track.sampleSizes.length}");
-      append("MP4 Queue: ${out.length} AUs (${_idrOnly ? "IDR-only" : "all"})");
+      append("MP4 Queue: ${out.length} AUs (full I/P decode order)");
       if (out.isEmpty) {
-        append(
-          "MP4 has no playable AU for current mode. Try disabling IDR only, or use Baseline+CAVLC MP4 with IDR frames.",
-        );
+        append("MP4 has no playable access units.");
         return;
       }
 
-      out.sort((a, b) => a.ptsMs.compareTo(b.ptsMs));
-      queue = out;
+      final firstIdr = out.indexWhere((au) => au.hasIdr);
+      if (firstIdr < 0) {
+        append('MP4 has no random-access picture.');
+        return;
+      }
+      if (firstIdr > 0) {
+        append('Dropped $firstIdr leading dependent samples.');
+      }
+
+      // MP4 samples are already in decode order. Reordering them by timestamp
+      // would break reference state for streams whose PTS differs from DTS.
+      _installQueue(out.sublist(firstIdr));
+
+      Mp4AudioTrack? audioTrack;
+      try {
+        audioTrack = Mp4Demux.parseAacTrack(bytes);
+      } catch (error) {
+        // Audio is optional. A malformed/unsupported audio sample entry must
+        // not discard an otherwise valid H.264 queue.
+        audioInfo = 'Audio unavailable: $error';
+        append(audioInfo);
+      }
+      final playableAudioTrack = audioTrack;
+      if (playableAudioTrack != null) {
+        append(
+          'MP4 audio: AAC-LC ${playableAudioTrack.sampleRate} Hz, '
+          '${playableAudioTrack.channelCount} channel(s), '
+          '${playableAudioTrack.sampleSizes.length} access units',
+        );
+        append('Decoding AAC entirely in Dart…');
+        try {
+          final timeline = await decodeMp4AacToPcmInBackground(
+            bytes,
+            playableAudioTrack,
+          );
+          await _installAudioTimeline(timeline);
+          append(
+            'Audio ready: ${timeline.frameCount} PCM frames, '
+            '${_fmtMs(timeline.durationUs ~/ 1000)}',
+          );
+        } catch (error) {
+          audioInfo = 'Audio unavailable: $error';
+          append(audioInfo);
+        }
+      } else {
+        audioInfo = 'Audio: this MP4 has no AAC track';
+      }
 
       append("MP4 Queue built: ${queue.length} samples");
       if (queue.isNotEmpty) {
@@ -636,66 +987,147 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
     } catch (e) {
       append("MP4 ERROR: $e");
     } finally {
-      setState(() => loading = false);
+      if (mounted) setState(() => loading = false);
     }
   }
 
-  void play() {
+  Future<void> play() => _serializeTransport(_play);
+
+  Future<void> _play() async {
     if (queue.isEmpty) return;
-    if (_nextAuIndex >= queue.length) _nextAuIndex = 0;
-    final startMs = current?.ptsMs ?? queue[_nextAuIndex].ptsMs;
-    clock.play(fromMs: startMs);
+    final audio = _audioController;
+    if (_decodePump.nextIndex >= queue.length) {
+      _resetDecodePosition(0, message: 'Replaying from start…');
+      if (audio != null) {
+        await audio.seekToMediaTimeUs(queue.first.ptsMs * 1000);
+      }
+    }
+    final startMs = _decodePump.nextIndex == 0
+        ? queue.first.ptsMs
+        : clock.nowMs;
+    if (audio != null && _audioCovers(audio, startMs)) {
+      final driftMs = (audio.currentMediaTimeMs - startMs).abs();
+      if (driftMs > 50) {
+        await audio.seekToMediaTimeUs(startMs * 1000);
+      }
+      await audio.play();
+      clock.play(
+        fromMs: audio.currentMediaTimeMs,
+        timeSource: () => audio.currentMediaTimeMs,
+      );
+    } else {
+      clock.play(fromMs: startMs);
+    }
   }
 
-  void pause() => clock.pause();
+  Future<void> pause() => _serializeTransport(_pause);
 
-  void nextIdr() {
+  Future<void> _pause() async {
+    final audio = _audioController;
+    if (audio != null && audio.isPlaying) await audio.pause();
+    clock.pause();
+  }
+
+  Future<void> nextIdr() => _serializeTransport(_nextIdr);
+
+  Future<void> _nextIdr() async {
     if (queue.isEmpty) return;
-    for (int i = _nextAuIndex; i < queue.length; i++) {
+    for (int i = _decodePump.nextIndex; i < queue.length; i++) {
       if (!queue[i].hasIdr) continue;
-      clock.setTime(queue[i].ptsMs);
-      setState(() {
-        current = queue[i];
-        _nextAuIndex = i + 1;
-      });
+      await _seekToAccessUnit(i);
       return;
     }
   }
 
-  void prevIdr() {
+  Future<void> prevIdr() => _serializeTransport(_prevIdr);
+
+  Future<void> _prevIdr() async {
     if (queue.isEmpty) return;
     final curMs = clock.nowMs;
-    int start = _nextAuIndex - 2;
+    int start = _decodePump.nextIndex - 2;
     if (start < 0) start = 0;
     if (start >= queue.length) start = queue.length - 1;
 
     for (int i = start; i >= 0; i--) {
       if (queue[i].hasIdr && queue[i].ptsMs < curMs) {
-        clock.setTime(queue[i].ptsMs);
-        setState(() {
-          current = queue[i];
-          _nextAuIndex = i + 1;
-        });
+        await _seekToAccessUnit(i);
         return;
       }
     }
   }
 
-  void seekToStart() {
-    if (queue.isEmpty) return;
+  void _resetDecodePosition(int index, {required String message}) {
     clock.pause();
+    decoder.reset();
+    _decodePump.seekToIndex(index);
     setState(() {
       current = null;
-      _nextAuIndex = 0;
-      _lastUiUpdateMs = queue.first.ptsMs;
+      decodeInfo = message;
+      _currentRgba = null;
+      _frameWidth = 0;
+      _frameHeight = 0;
     });
+  }
+
+  Future<void> _seekToAccessUnit(int index) async {
+    final audio = _audioController;
+    final resumeAfterSeek = clock.isPlaying || (audio?.isPlaying ?? false);
+    if (audio != null && audio.isPlaying) await audio.pause();
+    final decodeStart = _nearestPrecedingIdr(index);
+    final targetMs = queue[index].ptsMs;
+    _resetDecodePosition(
+      decodeStart,
+      message: 'Seeking to ${_fmtMs(targetMs)}…',
+    );
+    // Decode dependencies from the keyframe through the requested AU. The
+    // serial pump presents only the latest completed frame.
+    if (audio != null) await audio.seekToMediaTimeUs(targetMs * 1000);
+    clock.setTime(targetMs);
+    if (resumeAfterSeek) {
+      if (audio != null && _audioCovers(audio, targetMs)) {
+        await audio.play();
+        clock.play(
+          fromMs: audio.currentMediaTimeMs,
+          timeSource: () => audio.currentMediaTimeMs,
+        );
+      } else {
+        clock.play(fromMs: targetMs);
+      }
+    }
+  }
+
+  bool _audioCovers(AudioPlaybackController audio, int mediaTimeMs) {
+    final timeline = audio.timeline;
+    if (timeline == null || !audio.hasAudio) return false;
+    final mediaTimeUs = mediaTimeMs * Duration.microsecondsPerMillisecond;
+    return mediaTimeUs >= timeline.basePtsUs && mediaTimeUs < timeline.endPtsUs;
+  }
+
+  int _nearestPrecedingIdr(int index) {
+    for (int i = index; i >= 0; i--) {
+      if (queue[i].hasIdr) return i;
+    }
+    return 0;
+  }
+
+  Future<void> seekToStart() => _serializeTransport(_seekToStart);
+
+  Future<void> _seekToStart() async {
+    if (queue.isEmpty) return;
+    final audio = _audioController;
+    if (audio != null && audio.isPlaying) await audio.pause();
+    _resetDecodePosition(0, message: 'At start');
+    if (audio != null) {
+      await audio.seekToMediaTimeUs(queue.first.ptsMs * 1000);
+    }
     clock.setTime(queue.first.ptsMs);
   }
 
   @override
   Widget build(BuildContext context) {
-    final url = urlCtrl.text.trim().toLowerCase();
-    final isMp4 = url.endsWith('.mp4');
+    final input = urlCtrl.text.trim();
+    final inputPath = (Uri.tryParse(input)?.path ?? input).toLowerCase();
+    final isMp4 = inputPath.endsWith('.mp4');
 
     return Scaffold(
       appBar: AppBar(title: const Text('Pure Dart Playback')),
@@ -706,6 +1138,7 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
             children: [
               TextField(
                 controller: urlCtrl,
+                onChanged: (_) => setState(() {}),
                 decoration: const InputDecoration(
                   labelText: '.m3u8 or .mp4 URL',
                   border: OutlineInputBorder(),
@@ -717,11 +1150,13 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
                 runSpacing: 8,
                 children: [
                   FilledButton(
-                    onPressed: loading ? null : buildQueue,
+                    key: const Key('build-hls'),
+                    onPressed: loading || isMp4 ? null : buildQueue,
                     child: Text(loading ? 'Building…' : 'Build Queue (HLS/TS)'),
                   ),
                   FilledButton(
-                    onPressed: loading
+                    key: const Key('build-mp4'),
+                    onPressed: loading || !isMp4
                         ? null
                         : () =>
                               buildQueueFromMp4(Uri.parse(urlCtrl.text.trim())),
@@ -747,15 +1182,12 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
                     onPressed: nextIdr,
                     child: const Text('Next IDR'),
                   ),
-                  Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Text('IDR only'),
-                      Switch(
-                        value: _idrOnly,
-                        onChanged: (v) => setState(() => _idrOnly = v),
-                      ),
-                    ],
+                  const Padding(
+                    padding: EdgeInsets.only(left: 8),
+                    child: Text(
+                      'Decode: sequential I/P',
+                      style: TextStyle(fontFamily: 'monospace'),
+                    ),
                   ),
                   if (isMp4)
                     const Padding(
@@ -773,6 +1205,13 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
                         style: TextStyle(fontFamily: 'monospace'),
                       ),
                     ),
+                  Padding(
+                    padding: const EdgeInsets.only(left: 8),
+                    child: Text(
+                      audioInfo,
+                      style: const TextStyle(fontFamily: 'monospace'),
+                    ),
+                  ),
                 ],
               ),
               const SizedBox(height: 10),
