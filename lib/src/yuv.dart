@@ -31,7 +31,6 @@ Uint8List yuv420ToRgba(Yuv420Frame f) {
       final uVal = f.u[uvIndex];
       final vVal = f.v[uvIndex];
 
-      // BT.601
       final c = yVal - 16;
       final d = uVal - 128;
       final e = vVal - 128;
@@ -40,18 +39,21 @@ Uint8List yuv420ToRgba(Yuv420Frame f) {
       int g = ((298 * c - 100 * d - 208 * e + 128) >> 8);
       int b = ((298 * c + 516 * d + 128) >> 8);
 
-      if (r < 0)
+      if (r < 0) {
         r = 0;
-      else if (r > 255)
+      } else if (r > 255) {
         r = 255;
-      if (g < 0)
+      }
+      if (g < 0) {
         g = 0;
-      else if (g > 255)
+      } else if (g > 255) {
         g = 255;
-      if (b < 0)
+      }
+      if (b < 0) {
         b = 0;
-      else if (b > 255)
+      } else if (b > 255) {
         b = 255;
+      }
 
       out[o++] = r;
       out[o++] = g;
