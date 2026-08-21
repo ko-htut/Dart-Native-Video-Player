@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:io' as io;
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
@@ -22,6 +23,7 @@ import 'src/pes_pts.dart';
 import 'src/access_unit_pts.dart';
 import 'src/player_clock.dart';
 import 'src/decoder/h264_decode_worker.dart';
+import 'src/decoder/android_h264_texture_decoder.dart';
 import 'src/decoder/pps.dart';
 import 'src/decoder/slice_header.dart';
 import 'src/decoder/sps.dart';
@@ -65,19 +67,50 @@ final class _DetachedHlsResources {
 }
 
 final class _PresentedVideoFrame {
-  const _PresentedVideoFrame({
+  const _PresentedVideoFrame.software({
     required this.accessUnit,
     required this.rgba,
     required this.width,
     required this.height,
     required this.decodeInfo,
-  });
+  }) : textureId = null;
+
+  const _PresentedVideoFrame.hardware({
+    required this.accessUnit,
+    required this.textureId,
+    required this.width,
+    required this.height,
+    required this.decodeInfo,
+  }) : rgba = null;
 
   final TimestampedAccessUnit accessUnit;
-  final Uint8List rgba;
+  final Uint8List? rgba;
+  final int? textureId;
   final int width;
   final int height;
   final String decodeInfo;
+}
+
+sealed class _VideoDecodeResult {
+  const _VideoDecodeResult();
+}
+
+final class _SoftwareVideoDecodeResult extends _VideoDecodeResult {
+  const _SoftwareVideoDecodeResult(this.decoded);
+
+  final H264WorkerDecodeResult decoded;
+}
+
+final class _HardwareVideoDecodeResult extends _VideoDecodeResult {
+  const _HardwareVideoDecodeResult(this.receipt);
+
+  final AndroidH264QueueReceipt receipt;
+}
+
+final class _HardwareFallbackPending implements Exception {
+  const _HardwareFallbackPending(this.cause);
+
+  final Object cause;
 }
 
 bool _shouldRetryHlsSegment(Object error) {
@@ -125,10 +158,22 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
   TimestampedAccessUnit? current;
 
   final decoder = H264DecodeWorker();
+  final AndroidH264TextureDecoder? hardwareDecoder = io.Platform.isAndroid
+      ? AndroidH264TextureDecoder()
+      : null;
   final frameRenderer = YuvRgbaRenderWorker();
-  late SequentialDecodePump<TimestampedAccessUnit, H264WorkerDecodeResult>
+  late SequentialDecodePump<TimestampedAccessUnit, _VideoDecodeResult>
   _decodePump;
   bool _hasDecodePump = false;
+  bool _hardwareVideoSupported = false;
+  bool _hardwareVideoActive = false;
+  bool _hardwareFallbackPending = false;
+  Object? _hardwareFallbackCause;
+  StreamSubscription<AndroidH264RenderedFrame>? _hardwareFrames;
+  StreamSubscription<Object>? _hardwareErrors;
+  final SplayTreeMap<int, TimestampedAccessUnit> _hardwareQueuedFrames =
+      SplayTreeMap<int, TimestampedAccessUnit>();
+  String _hardwareDecoderName = 'MediaCodec';
   String decodeInfo = '';
   String audioInfo = 'Audio: none';
 
@@ -169,6 +214,7 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
   static const int _lateNonReferenceBSkipThresholdMs = 100;
   static const int _highResolutionBSkipThresholdMs = 0;
   static const int _highResolutionPixelThreshold = 1280 * 720;
+  static const int _hardwareDecodeLeadMs = 500;
   static const Duration _livePcmRetentionDuration = Duration(minutes: 5);
   static const int _livePcmMaxBytes = 64 * 1024 * 1024;
 
@@ -203,15 +249,34 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
   @override
   void initState() {
     super.initState();
+    final hardware = hardwareDecoder;
+    if (hardware != null) {
+      _hardwareFrames = hardware.renderedFrames.listen(
+        _handleHardwareFrameRendered,
+      );
+      _hardwareErrors = hardware.errors.listen(_handleHardwareDecoderError);
+      unawaited(_probeHardwareVideo(hardware));
+    }
     _configureDecodePump(rolling: false);
+  }
+
+  Future<void> _probeHardwareVideo(AndroidH264TextureDecoder hardware) async {
+    try {
+      final supported = await hardware.isSupported();
+      if (!mounted) return;
+      _hardwareVideoSupported = supported;
+      if (supported) append('Android hardware H.264 decoder available');
+    } catch (error) {
+      if (mounted) append('Hardware H.264 probe failed; using Dart: $error');
+    }
   }
 
   void _configureDecodePump({required bool rolling}) {
     if (_hasDecodePump) _decodePump.dispose();
     _decodePump =
-        SequentialDecodePump<TimestampedAccessUnit, H264WorkerDecodeResult>(
+        SequentialDecodePump<TimestampedAccessUnit, _VideoDecodeResult>(
           timestampOf: (au) => au.ptsMs,
-          decode: (au) => decoder.decodeAccessUnitOrThrow(au.nals),
+          decode: _decodeVideoAccessUnit,
           onLatestDecoded: _presentDecodedFrame,
           onDecodeError: _handleDecodeError,
           onQueueDrained: _handleQueueDrained,
@@ -224,6 +289,7 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
           isDependencyBoundary: rolling ? (au) => au.hasIdr : null,
           presentationMayBeReordered: true,
           shouldSkipDecode: (au, requestedThroughMs) {
+            if (_hardwareVideoActive) return false;
             final resolution = _qualityRenditionDimensions(
               _qualityRenditionAt(au.ptsMs),
             );
@@ -240,7 +306,67 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
           },
         );
     _hasDecodePump = true;
-    clock.onFrameDue = _decodePump.requestThrough;
+    clock.onFrameDue = _requestVideoThrough;
+    clock.onPlaybackStateChanged = _syncHardwareClock;
+  }
+
+  void _requestVideoThrough(int nowMs) {
+    final lead = _hardwareVideoActive && clock.isPlaying
+        ? _hardwareDecodeLeadMs
+        : 0;
+    _decodePump.requestThrough(nowMs + lead);
+  }
+
+  void _syncHardwareClock(int nowMs, bool playing) {
+    final hardware = hardwareDecoder;
+    if (!_hardwareVideoActive || hardware == null) return;
+    unawaited(
+      hardware
+          .updateClock(mediaTimeUs: nowMs * 1000, playing: playing)
+          .catchError((Object error, StackTrace stackTrace) {
+            _handleHardwareDecoderError(error);
+          }),
+    );
+  }
+
+  Future<_VideoDecodeResult> _decodeVideoAccessUnit(
+    TimestampedAccessUnit accessUnit,
+  ) async {
+    if (_hardwareFallbackPending) {
+      throw _HardwareFallbackPending(
+        _hardwareFallbackCause ?? 'MediaCodec failed',
+      );
+    }
+    final hardware = hardwareDecoder;
+    if (_hardwareVideoActive && hardware != null) {
+      try {
+        final receipt = await hardware.queueAccessUnit(
+          nals: accessUnit.nals,
+          presentationTimeUs: accessUnit.ptsMs * 1000,
+          clockMediaTimeUs: clock.nowMs * 1000,
+          playing: clock.isPlaying,
+        );
+        _hardwareDecoderName = receipt.decoderName;
+        _hardwareQueuedFrames[accessUnit.ptsMs] = accessUnit;
+        return _HardwareVideoDecodeResult(receipt);
+      } catch (error) {
+        // A first-IDR configure failure can safely retry through the Dart
+        // decoder. A later dependent picture cannot switch decoder state
+        // mid-GOP, so it is reported and recovered by the normal IDR rebuild.
+        if (accessUnit.hasIdr) {
+          _hardwareVideoSupported = false;
+          _hardwareVideoActive = false;
+          decoder.reset();
+          if (mounted) append('MediaCodec unavailable; using Dart: $error');
+        } else {
+          _handleHardwareDecoderError(error);
+          throw _HardwareFallbackPending(error);
+        }
+      }
+    }
+    return _SoftwareVideoDecodeResult(
+      await decoder.decodeAccessUnitOrThrow(accessUnit.nals),
+    );
   }
 
   void _handleDecodeQueueState(SequentialDecodeQueueState state) {
@@ -367,8 +493,13 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
 
   void _presentDecodedFrame(
     TimestampedAccessUnit au,
-    H264WorkerDecodeResult decoded,
+    _VideoDecodeResult result,
   ) {
+    if (result case _HardwareVideoDecodeResult(:final receipt)) {
+      _hardwareDecoderName = receipt.decoderName;
+      return;
+    }
+    final decoded = (result as _SoftwareVideoDecodeResult).decoded;
     final frame = decoded.frame;
     final stats = decoded.stats;
     if (!mounted) return;
@@ -401,7 +532,7 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         decodeInfo =
             '$frameDecodeInfo'
             '${coalesced == 0 ? "" : " • render-coalesced $coalesced"}';
-        _presentedVideo.value = _PresentedVideoFrame(
+        _presentedVideo.value = _PresentedVideoFrame.software(
           accessUnit: au,
           rgba: rgba,
           width: renderSize.width,
@@ -416,6 +547,113 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         }
       },
     );
+  }
+
+  void _handleHardwareFrameRendered(AndroidH264RenderedFrame frame) {
+    if (!mounted || !_hardwareVideoActive) return;
+    final ptsMs =
+        frame.presentationTimeUs ~/ Duration.microsecondsPerMillisecond;
+    final accessUnit = _hardwareQueuedFrames[ptsMs];
+    if (accessUnit == null) return;
+    final stale = <int>[
+      for (final queuedPts in _hardwareQueuedFrames.keys)
+        if (queuedPts <= ptsMs) queuedPts,
+    ];
+    for (final queuedPts in stale) {
+      _hardwareQueuedFrames.remove(queuedPts);
+    }
+
+    final textureId = hardwareDecoder?.textureId;
+    if (textureId == null) return;
+    final rendition = _qualityRenditionAt(ptsMs);
+    if (rendition != null &&
+        !identical(_displayedQualityRendition, rendition)) {
+      _displayedQualityRendition = rendition;
+      _refreshQualityInfo();
+      append('Quality now visible: ${rendition.label}');
+    }
+    _observeAutoQuality(
+      starved: false,
+      latenessMs: math.max(0, clock.nowMs - ptsMs),
+    );
+    current = accessUnit;
+    decodeInfo =
+        'Hardware H.264 ($_hardwareDecoderName): '
+        '${frame.width}x${frame.height}';
+    _presentedVideo.value = _PresentedVideoFrame.hardware(
+      accessUnit: accessUnit,
+      textureId: textureId,
+      width: frame.width,
+      height: frame.height,
+      decodeInfo: decodeInfo,
+    );
+  }
+
+  void _handleHardwareDecoderError(Object error) {
+    if (!mounted || !_hardwareVideoActive) return;
+    final resumeAfterRecovery =
+        clock.isPlaying || (_audioController?.isPlaying ?? false);
+    _hardwareVideoSupported = false;
+    _hardwareVideoActive = false;
+    _hardwareFallbackPending = true;
+    _hardwareFallbackCause = error;
+    setState(() {
+      decodeInfo = 'Hardware decoder failed; switching to Dart…';
+    });
+    unawaited(
+      _serializeTransport(
+        () => _recoverWithSoftwareDecoder(
+          error,
+          resumeAfterRecovery: resumeAfterRecovery,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _recoverWithSoftwareDecoder(
+    Object error, {
+    required bool resumeAfterRecovery,
+  }) async {
+    final targetMs = clock.nowMs;
+    clock.pause();
+    final audio = _audioController;
+    if (audio != null && audio.isPlaying) await audio.pause();
+
+    final targetIndex = _latestAccessUnitAtOrBefore(targetMs);
+    _hardwareFallbackPending = false;
+    _hardwareFallbackCause = null;
+    if (targetIndex == null ||
+        !await _seekToAccessUnit(
+          targetIndex,
+          resumeAfterSeekOverride: resumeAfterRecovery,
+        )) {
+      if (mounted) {
+        setState(() {
+          decodeInfo = 'Hardware decoder failed: $error. Rebuild to retry.';
+        });
+      }
+      return;
+    }
+    if (mounted) {
+      append('MediaCodec failed; resumed with the Pure Dart decoder: $error');
+    }
+  }
+
+  int? _latestAccessUnitAtOrBefore(int targetMs) {
+    int? selectedIndex;
+    int? selectedPts;
+    for (
+      var index = _decodePump.firstRetainedIndex;
+      index < _decodePump.endIndex;
+      index++
+    ) {
+      final pts = _decodePump.itemAt(index).ptsMs;
+      if (pts <= targetMs && (selectedPts == null || pts >= selectedPts)) {
+        selectedIndex = index;
+        selectedPts = pts;
+      }
+    }
+    return selectedIndex ?? _firstRetainedIdrIndex();
   }
 
   ({int width, int height}) _qualityRenderSize(
@@ -501,6 +739,15 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
 
   void _resetDecodeAndRender() {
     decoder.reset();
+    _hardwareQueuedFrames.clear();
+    final hardware = hardwareDecoder;
+    if (hardware != null) {
+      unawaited(
+        hardware.reset().catchError((Object error, StackTrace stackTrace) {
+          if (mounted) append('Hardware decoder reset failed: $error');
+        }),
+      );
+    }
     frameRenderer.reset();
   }
 
@@ -614,6 +861,13 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
     Object error,
     StackTrace stackTrace,
   ) {
+    if (error is _HardwareFallbackPending) {
+      debugPrint(
+        'MediaCodec failed at ${au.ptsMs}ms; Dart fallback scheduled: '
+        '${error.cause}\n$stackTrace',
+      );
+      return;
+    }
     if (_rollingHls) {
       _failRollingPlayback(
         'Decoder stopped at ${au.ptsMs}ms: $error',
@@ -653,10 +907,14 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
     unawaited(_cancelActiveHlsBuild());
     urlCtrl.dispose();
     _presentedVideo.dispose();
+    unawaited(_hardwareFrames?.cancel());
+    unawaited(_hardwareErrors?.cancel());
     clock.dispose();
     _decodePump.dispose();
     frameRenderer.dispose();
     decoder.dispose();
+    final hardware = hardwareDecoder;
+    if (hardware != null) unawaited(hardware.dispose());
     unawaited(_disposeAudio());
     super.dispose();
   }
@@ -672,6 +930,9 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
     final epoch = ++_queueBuildEpoch;
     await _cancelActiveHlsBuild();
     _ensureBuildCurrent(epoch);
+    _hardwareVideoActive = _hardwareVideoSupported;
+    _hardwareFallbackPending = false;
+    _hardwareFallbackCause = null;
     setState(() {
       loading = true;
       log = '';
@@ -2582,7 +2843,7 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         _rollingHls && (_decodePump.firstRetainedIndex > 0 || audioWindowMoved);
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Pure Dart Playback')),
+      appBar: AppBar(title: const Text('NDVY Playback')),
       body: Padding(
         padding: const EdgeInsets.all(12),
         child: SingleChildScrollView(
@@ -2744,8 +3005,19 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
                                     style: const TextStyle(color: Colors.white),
                                   ),
                                 )
+                              : presented.textureId != null
+                              ? FittedBox(
+                                  fit: BoxFit.contain,
+                                  child: SizedBox(
+                                    width: presented.width.toDouble(),
+                                    height: presented.height.toDouble(),
+                                    child: Texture(
+                                      textureId: presented.textureId!,
+                                    ),
+                                  ),
+                                )
                               : PureFrameView(
-                                  rgba: presented.rgba,
+                                  rgba: presented.rgba!,
                                   width: presented.width,
                                   height: presented.height,
                                 ),

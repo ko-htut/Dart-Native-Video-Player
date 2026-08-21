@@ -11,6 +11,24 @@ class _Item {
 }
 
 void main() {
+  test('PlayerClock reports seek, play, and pause clock anchors', () {
+    final clock = PlayerClock();
+    final states = <({int nowMs, bool playing})>[];
+    clock.onPlaybackStateChanged = (nowMs, playing) {
+      states.add((nowMs: nowMs, playing: playing));
+    };
+
+    clock.setTime(120);
+    clock.play(fromMs: 120, timeSource: () => 145);
+    clock.pause();
+
+    expect(states.map((state) => state.playing), <bool>[false, true, false]);
+    expect(states[0].nowMs, 120);
+    expect(states[1].nowMs, 145);
+    expect(states[2].nowMs, 145);
+    clock.dispose();
+  });
+
   group('validateSequentialDecodeDependencyWindow', () {
     bool isBoundary(_Item item) => item.id.startsWith('K');
 
