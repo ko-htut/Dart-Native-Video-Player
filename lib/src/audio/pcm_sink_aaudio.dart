@@ -263,6 +263,67 @@ final class AAudioPcmAudioSink implements PcmAudioSink {
   }
 }
 
+/// Converts AAudio's absolute endpoint counter into accepted media progress.
+///
+/// The device counter can continue advancing while the output stream is
+/// starved. Those raw underrun frames are deliberately consumed while no media
+/// is outstanding, so a later write cannot inherit the old endpoint gap and be
+/// classified as played immediately.
+final class AAudioMediaPositionTracker {
+  AAudioMediaPositionTracker({int initialRawEndpointFrames = 0}) {
+    reset(rawEndpointFrames: initialRawEndpointFrames);
+  }
+
+  int _lastRawEndpointFrames = 0;
+  int _outstandingAcceptedFrames = 0;
+  int _mediaPositionFrames = 0;
+
+  int get rawEndpointFrames => _lastRawEndpointFrames;
+  int get outstandingAcceptedFrames => _outstandingAcceptedFrames;
+  int get mediaPositionFrames => _mediaPositionFrames;
+
+  void reset({int rawEndpointFrames = 0}) {
+    if (rawEndpointFrames < 0) {
+      throw ArgumentError.value(
+        rawEndpointFrames,
+        'rawEndpointFrames',
+        'must not be negative',
+      );
+    }
+    _lastRawEndpointFrames = rawEndpointFrames;
+    _outstandingAcceptedFrames = 0;
+    _mediaPositionFrames = 0;
+  }
+
+  void acceptMediaFrames(int frames) {
+    if (frames < 0) {
+      throw ArgumentError.value(frames, 'frames', 'must not be negative');
+    }
+    _outstandingAcceptedFrames += frames;
+  }
+
+  /// Observes a raw absolute endpoint counter and returns newly played media.
+  int observeRawEndpointFrames(int rawFrames) {
+    if (rawFrames < 0) return 0;
+    if (rawFrames < _lastRawEndpointFrames) {
+      // A stream/device reset starts a new raw epoch without rewinding media.
+      _lastRawEndpointFrames = rawFrames;
+      return 0;
+    }
+
+    final rawDelta = rawFrames - _lastRawEndpointFrames;
+    _lastRawEndpointFrames = rawFrames;
+    if (rawDelta == 0 || _outstandingAcceptedFrames == 0) return 0;
+
+    final consumed = rawDelta < _outstandingAcceptedFrames
+        ? rawDelta
+        : _outstandingAcceptedFrames;
+    _outstandingAcceptedFrames -= consumed;
+    _mediaPositionFrames += consumed;
+    return consumed;
+  }
+}
+
 @pragma('vm:entry-point')
 void _aaudioWorkerMain(SendPort ownerPort) {
   try {
@@ -291,12 +352,12 @@ final class _AAudioWorker {
   int _sampleRate = 0;
   int _channelCount = 0;
   int _generation = 0;
-  int _lastFramesRead = 0;
   int _lastXRunCount = 0;
-  int _totalFramesAccepted = 0;
   int _outstandingFrames = 0;
   int _maxBufferedFrames = 0;
   bool _playing = false;
+  final AAudioMediaPositionTracker _mediaPosition =
+      AAudioMediaPositionTracker();
 
   SendPort get commandPort => _commands.sendPort;
   int get _bytesPerFrame => _channelCount * 2;
@@ -424,10 +485,9 @@ final class _AAudioWorker {
     _sampleRate = sampleRate;
     _channelCount = channelCount;
     _generation = generation;
-    _lastFramesRead = 0;
     _lastXRunCount = 0;
-    _totalFramesAccepted = 0;
     _outstandingFrames = 0;
+    _mediaPosition.reset();
     final durationBufferedFrames = (sampleRate * 250) ~/ 1000;
     _maxBufferedFrames = durationBufferedFrames < _minimumBufferedFrames
         ? _minimumBufferedFrames
@@ -548,7 +608,7 @@ final class _AAudioWorker {
     if (result == 0) return;
 
     write.framesWritten += result;
-    _totalFramesAccepted += result;
+    _mediaPosition.acceptMediaFrames(result);
     if (write.framesWritten == write.totalFrames) {
       _writes.removeFirst();
       NativeMemory.instance.free(write.data);
@@ -558,13 +618,14 @@ final class _AAudioWorker {
 
   void _reportConsumption() {
     if (_stream == nullptr) return;
-    final framesRead = _safeFramesRead();
-    if (framesRead > _lastFramesRead) {
-      final consumed = framesRead - _lastFramesRead;
-      _lastFramesRead = framesRead;
-      _discardOutstandingFrames(consumed);
-      _ownerPort.send(<Object?>[0, 'consumed', _generation, consumed]);
-      _acceptWaitingWrites();
+    final rawFramesRead = _api.getFramesRead(_stream);
+    if (rawFramesRead >= 0) {
+      final consumed = _mediaPosition.observeRawEndpointFrames(rawFramesRead);
+      if (consumed > 0) {
+        _discardOutstandingFrames(consumed);
+        _ownerPort.send(<Object?>[0, 'consumed', _generation, consumed]);
+        _acceptWaitingWrites();
+      }
     }
     final xRuns = _api.getXRunCount(_stream);
     if (xRuns > _lastXRunCount) {
@@ -574,35 +635,7 @@ final class _AAudioWorker {
     }
   }
 
-  int _safeFramesRead() {
-    if (_stream == nullptr) return 0;
-    final value = _api.getFramesRead(_stream);
-    if (value < 0) return 0;
-    return value > _totalFramesAccepted ? _totalFramesAccepted : value;
-  }
-
-  int _playbackPositionFrames() {
-    if (_stream == nullptr) return 0;
-    final memory = NativeMemory.instance;
-    final framePosition = memory.allocate<Int64>(sizeOf<Int64>());
-    final timestampNanos = memory.allocate<Int64>(sizeOf<Int64>());
-    try {
-      final result = _api.getTimestamp(
-        _stream,
-        _AAudioApi.clockMonotonic,
-        framePosition,
-        timestampNanos,
-      );
-      if (result == 0 && framePosition.value >= 0) {
-        final value = framePosition.value;
-        return value > _totalFramesAccepted ? _totalFramesAccepted : value;
-      }
-      return _safeFramesRead();
-    } finally {
-      memory.free(timestampNanos);
-      memory.free(framePosition);
-    }
-  }
+  int _playbackPositionFrames() => _mediaPosition.mediaPositionFrames;
 
   void _waitForState(int targetState, String operation) {
     final nextState = NativeMemory.instance.allocate<Int32>(sizeOf<Int32>());
@@ -730,15 +763,6 @@ typedef _WaitForStateNative =
     Int32 Function(Pointer<_AAudioStream>, Int32, Pointer<Int32>, Int64);
 typedef _WaitForStateDart =
     int Function(Pointer<_AAudioStream>, int, Pointer<Int32>, int);
-typedef _StreamTimestampNative =
-    Int32 Function(
-      Pointer<_AAudioStream>,
-      Int32,
-      Pointer<Int64>,
-      Pointer<Int64>,
-    );
-typedef _StreamTimestampDart =
-    int Function(Pointer<_AAudioStream>, int, Pointer<Int64>, Pointer<Int64>);
 
 final class _AAudioApi {
   _AAudioApi() : _library = DynamicLibrary.open('libaaudio.so') {
@@ -772,10 +796,6 @@ final class _AAudioApi {
           'AAudioStream_setBufferSizeInFrames',
         );
     getFramesRead = _streamInt64('AAudioStream_getFramesRead');
-    getTimestamp = _library
-        .lookupFunction<_StreamTimestampNative, _StreamTimestampDart>(
-          'AAudioStream_getTimestamp',
-        );
     getXRunCount = _streamInt32('AAudioStream_getXRunCount');
     getSampleRate = _streamInt32('AAudioStream_getSampleRate');
     getChannelCount = _streamInt32('AAudioStream_getChannelCount');
@@ -790,7 +810,6 @@ final class _AAudioApi {
   static const int directionOutput = 0;
   static const int formatPcmI16 = 1;
   static const int sharingModeShared = 1;
-  static const int clockMonotonic = 1;
   static const int streamStatePaused = 6;
   static const int errorTimeout = -885;
 
@@ -810,7 +829,6 @@ final class _AAudioApi {
   late final _StreamWriteDart write;
   late final _StreamSetIntDart setBufferSizeInFrames;
   late final _StreamInt64Dart getFramesRead;
-  late final _StreamTimestampDart getTimestamp;
   late final _StreamInt32Dart getXRunCount;
   late final _StreamInt32Dart getSampleRate;
   late final _StreamInt32Dart getChannelCount;

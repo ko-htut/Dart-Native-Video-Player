@@ -7,6 +7,64 @@ import 'dart:typed_data';
 import 'native_memory.dart';
 import 'pcm_sink_api.dart';
 
+/// Recovery action derived from one AudioQueue running-state observation.
+final class AudioQueueRefillDecision {
+  const AudioQueueRefillDecision({
+    required this.emitUnderrun,
+    required this.restartQueue,
+  });
+
+  final bool emitUnderrun;
+  final bool restartQueue;
+}
+
+/// Tracks one open-tail AudioQueue starvation episode.
+///
+/// This pure-Dart state machine is shared by the FFI sink and deterministic
+/// tests. An underrun is reported once per stopped episode, while restart is
+/// requested only after refill supplies queued audio.
+final class AudioQueueStarvationTracker {
+  bool _openTail = false;
+  bool _underrunReported = false;
+  bool _reportUnderrunForEpisode = false;
+
+  bool get hasOpenTail => _openTail;
+  bool get hasReportedUnderrun => _underrunReported;
+
+  void noteOpenTail({bool reportUnderrun = true}) {
+    _openTail = true;
+    _reportUnderrunForEpisode |= reportUnderrun;
+  }
+
+  AudioQueueRefillDecision observe({
+    required bool logicallyPlaying,
+    required bool queueIsRunning,
+    required bool hasQueuedAudio,
+  }) {
+    if (!logicallyPlaying || !_openTail) {
+      return const AudioQueueRefillDecision(
+        emitUnderrun: false,
+        restartQueue: false,
+      );
+    }
+    final emitUnderrun =
+        !queueIsRunning && _reportUnderrunForEpisode && !_underrunReported;
+    if (emitUnderrun) _underrunReported = true;
+    return AudioQueueRefillDecision(
+      emitUnderrun: emitUnderrun,
+      restartQueue: !queueIsRunning && hasQueuedAudio,
+    );
+  }
+
+  void markRecovered() {
+    _openTail = false;
+    _underrunReported = false;
+    _reportUnderrunForEpisode = false;
+  }
+
+  void reset() => markRecovered();
+}
+
 /// PCM output backed directly by Audio Queue Services through `dart:ffi`.
 ///
 /// AudioToolbox owns four bounded native buffers. Its output callback only
@@ -38,6 +96,7 @@ final class AudioQueuePcmAudioSink implements PcmAudioSink {
   int _lastPositionFrames = 0;
   int _totalFramesEnqueued = 0;
   bool _audioSessionActive = false;
+  final AudioQueueStarvationTracker _starvation = AudioQueueStarvationTracker();
 
   @override
   PcmAudioFormat? format;
@@ -119,6 +178,14 @@ final class AudioQueuePcmAudioSink implements PcmAudioSink {
     }
     state = PcmSinkState.playing;
     _emitState();
+    if (_inFlight.isEmpty) {
+      // Starting before the first producer write may also stop AudioQueue, but
+      // it is buffering rather than a media underrun. Refill still restarts it.
+      _starvation.noteOpenTail(reportUnderrun: false);
+      _observeStarvation(hasQueuedAudio: false);
+    } else {
+      _starvation.markRecovered();
+    }
   }
 
   @override
@@ -127,6 +194,7 @@ final class AudioQueuePcmAudioSink implements PcmAudioSink {
     _check(_api.pause(_queue), 'AudioQueuePause');
     _deactivateAudioSession();
     state = PcmSinkState.paused;
+    _starvation.reset();
     _emitState();
   }
 
@@ -263,6 +331,7 @@ final class AudioQueuePcmAudioSink implements PcmAudioSink {
       }
       _lastPositionFrames = 0;
       _totalFramesEnqueued = 0;
+      _starvation.reset();
     } catch (_) {
       _closeQueue('AudioQueue configuration failed');
       rethrow;
@@ -274,6 +343,7 @@ final class AudioQueuePcmAudioSink implements PcmAudioSink {
 
   void _pumpPending() {
     if (_queue == nullptr) return;
+    var enqueuedAny = false;
     while (_freeBuffers.isNotEmpty && _pending.isNotEmpty) {
       final write = _pending.removeFirst();
       if (write.generation != generation) {
@@ -310,7 +380,9 @@ final class AudioQueuePcmAudioSink implements PcmAudioSink {
       );
       _totalFramesEnqueued += write.frames;
       write.completer.complete(write.frames);
+      enqueuedAny = true;
     }
+    if (enqueuedAny) _observeStarvation(hasQueuedAudio: true);
   }
 
   void _onBufferConsumed(int epoch, int bufferAddress) {
@@ -320,6 +392,9 @@ final class AudioQueuePcmAudioSink implements PcmAudioSink {
     final buffer = Pointer<_AudioQueueBuffer>.fromAddress(bufferAddress);
     buffer.ref.audioDataByteSize = 0;
     _freeBuffers.add(buffer);
+    if (_inFlight.isEmpty && state == PcmSinkState.playing) {
+      _starvation.noteOpenTail();
+    }
     if (inFlight.generation == generation && !_events.isClosed) {
       _events.add(
         PcmSinkEvent(
@@ -330,6 +405,53 @@ final class AudioQueuePcmAudioSink implements PcmAudioSink {
       );
     }
     _pumpPending();
+    if (_inFlight.isEmpty && state == PcmSinkState.playing) {
+      _observeStarvation(hasQueuedAudio: false);
+    }
+  }
+
+  void _observeStarvation({required bool hasQueuedAudio}) {
+    if (state != PcmSinkState.playing || !_starvation.hasOpenTail) return;
+    late final bool running;
+    try {
+      running = _api.isRunning(_queue, _memory);
+    } catch (error) {
+      _emitError('$error');
+      return;
+    }
+
+    final decision = _starvation.observe(
+      logicallyPlaying: true,
+      queueIsRunning: running,
+      hasQueuedAudio: hasQueuedAudio,
+    );
+    if (decision.emitUnderrun && !_events.isClosed) {
+      _events.add(
+        PcmSinkEvent(
+          type: PcmSinkEventType.underrun,
+          generation: generation,
+          frames: 1,
+          message: 'AudioQueue stopped after an open-tail PCM underrun',
+        ),
+      );
+    }
+    if (running && hasQueuedAudio) {
+      _starvation.markRecovered();
+      return;
+    }
+    if (!decision.restartQueue) return;
+
+    try {
+      _api.setAudioSessionActive(true);
+      _audioSessionActive = Platform.isIOS;
+      _check(
+        _api.start(_queue, nullptr.cast<_AudioTimeStamp>()),
+        'AudioQueueStart after underrun refill',
+      );
+      _starvation.markRecovered();
+    } catch (error) {
+      _emitError('$error');
+    }
   }
 
   void _closeQueue(String pendingReason) {
@@ -347,6 +469,7 @@ final class AudioQueuePcmAudioSink implements PcmAudioSink {
     _bufferCapacityBytes = 0;
     _lastPositionFrames = 0;
     _totalFramesEnqueued = 0;
+    _starvation.reset();
   }
 
   void _deactivateAudioSession() {
@@ -587,6 +710,10 @@ typedef _AudioQueueGetCurrentTimeDart =
       Pointer<_AudioTimeStamp>,
       Pointer<Uint8>,
     );
+typedef _AudioQueueGetPropertyNative =
+    Int32 Function(Pointer<Void>, Uint32, Pointer<Void>, Pointer<Uint32>);
+typedef _AudioQueueGetPropertyDart =
+    int Function(Pointer<Void>, int, Pointer<Void>, Pointer<Uint32>);
 typedef _AudioSessionInitializeNative =
     Int32 Function(Pointer<Void>, Pointer<Void>, Pointer<Void>, Pointer<Void>);
 typedef _AudioSessionInitializeDart =
@@ -635,6 +762,11 @@ final class _AudioQueueApi {
           _AudioQueueGetCurrentTimeNative,
           _AudioQueueGetCurrentTimeDart
         >('AudioQueueGetCurrentTime');
+    getProperty = _library
+        .lookupFunction<
+          _AudioQueueGetPropertyNative,
+          _AudioQueueGetPropertyDart
+        >('AudioQueueGetProperty');
     if (Platform.isIOS) {
       audioSessionInitialize = _library
           .lookupFunction<
@@ -658,6 +790,7 @@ final class _AudioQueueApi {
   static const int formatFlagSignedInteger = 1 << 2;
   static const int formatFlagPacked = 1 << 3;
   static const int sampleTimeValid = 1 << 0;
+  static const int propertyIsRunning = 0x6171726e; // 'aqrn'
   static const int audioSessionAlreadyInitialized = 0x696e6974; // 'init'
   static const int audioSessionPropertyCategory = 0x61636174; // 'acat'
   static const int audioSessionCategoryMediaPlayback = 0x6d656469; // 'medi'
@@ -670,6 +803,7 @@ final class _AudioQueueApi {
   late final _AudioQueueStartDart start;
   late final _AudioQueuePauseDart pause;
   late final _AudioQueueGetCurrentTimeDart getCurrentTime;
+  late final _AudioQueueGetPropertyDart getProperty;
   _AudioSessionInitializeDart? audioSessionInitialize;
   _AudioSessionSetPropertyDart? audioSessionSetProperty;
   _AudioSessionSetActiveDart? audioSessionSetActive;
@@ -713,6 +847,35 @@ final class _AudioQueueApi {
       throw PcmSinkStateException(
         'AudioSessionSetActive($active) failed with OSStatus $status',
       );
+    }
+  }
+
+  bool isRunning(Pointer<Void> queue, NativeMemory memory) {
+    final running = memory.allocate<Uint32>(sizeOf<Uint32>());
+    final valueSize = memory.allocate<Uint32>(sizeOf<Uint32>());
+    try {
+      valueSize.value = sizeOf<Uint32>();
+      final status = getProperty(
+        queue,
+        propertyIsRunning,
+        running.cast<Void>(),
+        valueSize,
+      );
+      if (status != 0) {
+        throw PcmSinkStateException(
+          'AudioQueueGetProperty(IsRunning) failed with OSStatus $status',
+        );
+      }
+      if (valueSize.value != sizeOf<Uint32>()) {
+        throw PcmSinkStateException(
+          'AudioQueueGetProperty(IsRunning) returned '
+          '${valueSize.value} bytes',
+        );
+      }
+      return running.value != 0;
+    } finally {
+      memory.free(valueSize);
+      memory.free(running);
     }
   }
 }

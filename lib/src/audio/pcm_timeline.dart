@@ -1,42 +1,36 @@
 import 'dart:math' as math;
 import 'dart:typed_data';
 
-/// A bounded packet of signed, interleaved, little-endian-ready PCM16.
-final class PcmAudioChunk {
-  const PcmAudioChunk({
-    required this.startFrame,
-    required this.frameCount,
-    required this.samples,
-  });
+import 'pcm_source.dart';
 
-  final int startFrame;
-  final int frameCount;
-  final Int16List samples;
-}
+export 'pcm_source.dart' show PcmAudioChunk, PcmAudioSource, floatSampleToPcm16;
 
 /// Decoded audio on one monotonic media timeline.
-final class PcmAudioTimeline {
+final class PcmAudioTimeline extends PcmAudioSourceBase {
   PcmAudioTimeline({
-    required this.sampleRate,
-    required this.channels,
-    required this.basePtsUs,
+    required super.sampleRate,
+    required super.channels,
+    required super.basePtsUs,
     required Int16List interleavedSamples,
   }) : samples = Int16List.fromList(interleavedSamples) {
-    _validate();
+    _validateSamples();
   }
 
   PcmAudioTimeline._owned({
-    required this.sampleRate,
-    required this.channels,
-    required this.basePtsUs,
+    required super.sampleRate,
+    required super.channels,
+    required super.basePtsUs,
     required this.samples,
   }) {
-    _validate();
+    _validateSamples();
   }
 
-  void _validate() {
-    if (sampleRate <= 0) throw ArgumentError.value(sampleRate, 'sampleRate');
-    if (channels <= 0) throw ArgumentError.value(channels, 'channels');
+  final Int16List samples;
+
+  @override
+  int get frameCount => samples.length ~/ channels;
+
+  void _validateSamples() {
     if (samples.length % channels != 0) {
       throw ArgumentError(
         'Interleaved sample count ${samples.length} is not divisible by '
@@ -45,29 +39,28 @@ final class PcmAudioTimeline {
     }
   }
 
-  final int sampleRate;
-  final int channels;
-  final int basePtsUs;
-  final Int16List samples;
-
-  int get frameCount => samples.length ~/ channels;
-  int get durationUs =>
-      frameCount * Duration.microsecondsPerSecond ~/ sampleRate;
-  int get endPtsUs => basePtsUs + durationUs;
-
-  int mediaTimeUsForFrame(int frame) {
-    final bounded = frame.clamp(0, frameCount);
-    return basePtsUs + bounded * Duration.microsecondsPerSecond ~/ sampleRate;
+  @override
+  Future<PcmAudioChunk> readFrames(
+    int firstFrame, {
+    required int maxFrames,
+  }) async {
+    final startFrame = validateRead(firstFrame, maxFrames);
+    final count = math.min(maxFrames, frameCount - startFrame);
+    final firstSample = startFrame * channels;
+    final lastSample = (startFrame + count) * channels;
+    return PcmAudioChunk.pcm16le(
+      startFrame: startFrame,
+      frameCount: count,
+      pcm16le: pcm16SamplesToLittleEndianBytes(
+        samples,
+        start: firstSample,
+        end: lastSample,
+      ),
+    );
   }
 
-  int frameForMediaTimeUs(int mediaTimeUs) {
-    if (mediaTimeUs <= basePtsUs) return 0;
-    if (mediaTimeUs >= endPtsUs) return frameCount;
-    return ((mediaTimeUs - basePtsUs) *
-            sampleRate ~/
-            Duration.microsecondsPerSecond)
-        .clamp(0, frameCount);
-  }
+  @override
+  Future<void> dispose() async {}
 
   Iterable<PcmAudioChunk> chunksFromFrame(
     int firstFrame, {
@@ -81,10 +74,14 @@ final class PcmAudioTimeline {
       final count = math.min(framesPerChunk, frameCount - frame);
       final firstSample = frame * channels;
       final lastSample = (frame + count) * channels;
-      yield PcmAudioChunk(
+      yield PcmAudioChunk.pcm16le(
         startFrame: frame,
         frameCount: count,
-        samples: Int16List.fromList(samples.sublist(firstSample, lastSample)),
+        pcm16le: pcm16SamplesToLittleEndianBytes(
+          samples,
+          start: firstSample,
+          end: lastSample,
+        ),
       );
       frame += count;
     }
@@ -206,11 +203,4 @@ final class PcmAudioTimelineBuilder {
       samples: flattened,
     );
   }
-}
-
-int floatSampleToPcm16(double sample) {
-  if (!sample.isFinite) return 0;
-  if (sample <= -1.0) return -32768;
-  if (sample >= 1.0) return 32767;
-  return (sample * 32768.0).round().clamp(-32768, 32767);
 }

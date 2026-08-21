@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'bitreader.dart';
 import 'exp_golomb.dart';
 import 'rbsp.dart';
+import 'scaling_list_syntax.dart';
 
 /// Sequence parameter set fields required by the software decoder.
 ///
@@ -20,6 +21,7 @@ class SpsInfo {
   final int bitDepthChromaMinus8;
   final bool qpprimeYZeroTransformBypassFlag;
   final bool scalingMatrixPresent;
+  final List<H264ScalingListSyntax> scalingLists;
   final int log2MaxFrameNumMinus4;
   final int picOrderCntType;
   final int log2MaxPicOrderCntLsbMinus4;
@@ -58,6 +60,7 @@ class SpsInfo {
     required this.bitDepthChromaMinus8,
     required this.qpprimeYZeroTransformBypassFlag,
     required this.scalingMatrixPresent,
+    this.scalingLists = const <H264ScalingListSyntax>[],
     required this.log2MaxFrameNumMinus4,
     required this.picOrderCntType,
     required this.log2MaxPicOrderCntLsbMinus4,
@@ -86,6 +89,30 @@ class SpsInfo {
 
   int get maxPicOrderCntLsb => 1 << (log2MaxPicOrderCntLsbMinus4 + 4);
 
+  int get bitDepthLuma => bitDepthLumaMinus8 + 8;
+
+  int get bitDepthChroma => bitDepthChromaMinus8 + 8;
+
+  /// Alias matching the exact SPS syntax-element name.
+  bool get seqScalingMatrixPresentFlag => scalingMatrixPresent;
+
+  /// True when no sequence-level scaling-matrix syntax overrides Flat_*_16.
+  bool get usesFlatScalingMatrices => !seqScalingMatrixPresentFlag;
+
+  bool get hasExplicitScalingLists =>
+      scalingLists.any((list) => list.isExplicit);
+
+  /// Decoder-independent geometry/bit-depth subset used by the sfux stream.
+  bool get isProgressive8Bit420 =>
+      chromaFormatIdc == 1 &&
+      !separateColourPlaneFlag &&
+      bitDepthLumaMinus8 == 0 &&
+      bitDepthChromaMinus8 == 0 &&
+      !qpprimeYZeroTransformBypassFlag &&
+      frameMbsOnlyFlag;
+
+  bool get isHighProfile8Bit420 => profileIdc == 100 && isProgressive8Bit420;
+
   int get cropLeftPixels => frameCropLeftOffset * cropUnitX;
 
   int get cropRightPixels => frameCropRightOffset * cropUnitX;
@@ -96,17 +123,12 @@ class SpsInfo {
 
   bool get isSupportedBaseline420 =>
       (profileIdc == 66 || profileIdc == 77 || profileIdc == 88) &&
-      chromaFormatIdc == 1 &&
-      !separateColourPlaneFlag &&
-      bitDepthLumaMinus8 == 0 &&
-      bitDepthChromaMinus8 == 0 &&
-      !qpprimeYZeroTransformBypassFlag &&
-      !scalingMatrixPresent &&
-      frameMbsOnlyFlag;
+      isProgressive8Bit420 &&
+      usesFlatScalingMatrices;
 }
 
 SpsInfo parseSpsNal(Uint8List nal) {
-  if (nal.length < 2 || (nal.first & 0x1f) != 7) {
+  if (nal.length < 2 || (nal.first & 0x80) != 0 || (nal.first & 0x1f) != 7) {
     throw const FormatException('SPS NAL is missing or has the wrong NAL type');
   }
 
@@ -115,8 +137,16 @@ SpsInfo parseSpsNal(Uint8List nal) {
 
   final profileIdc = br.readBits(8);
   final constraintFlags = br.readBits(8);
+  if ((constraintFlags & 0x03) != 0) {
+    throw FormatException(
+      'SPS reserved_zero_2bits must be zero, got ${constraintFlags & 0x03}',
+    );
+  }
   final levelIdc = br.readBits(8);
   final spsId = readUE(br);
+  if (spsId > 31) {
+    throw FormatException('seq_parameter_set_id=$spsId exceeds 31');
+  }
 
   var chromaFormatIdc = 1;
   var separateColourPlaneFlag = false;
@@ -124,6 +154,7 @@ SpsInfo parseSpsNal(Uint8List nal) {
   var bitDepthChromaMinus8 = 0;
   var qpprimeYZeroTransformBypassFlag = false;
   var scalingMatrixPresent = false;
+  var scalingLists = _absentScalingLists(8);
 
   if (_hasExtendedProfileSyntax(profileIdc)) {
     chromaFormatIdc = readUE(br);
@@ -135,25 +166,38 @@ SpsInfo parseSpsNal(Uint8List nal) {
     }
     bitDepthLumaMinus8 = readUE(br);
     bitDepthChromaMinus8 = readUE(br);
+    if (bitDepthLumaMinus8 > 6 || bitDepthChromaMinus8 > 6) {
+      throw FormatException(
+        'Invalid SPS bit depth: luma=${bitDepthLumaMinus8 + 8}, '
+        'chroma=${bitDepthChromaMinus8 + 8}',
+      );
+    }
     qpprimeYZeroTransformBypassFlag = br.readBit() == 1;
     scalingMatrixPresent = br.readBit() == 1;
-    if (scalingMatrixPresent) {
-      final count = chromaFormatIdc == 3 ? 12 : 8;
-      for (var i = 0; i < count; i++) {
-        if (br.readBit() == 1) {
-          _skipScalingList(br, i < 6 ? 16 : 64);
-        }
-      }
-    }
+    final count = chromaFormatIdc == 3 ? 12 : 8;
+    scalingLists = scalingMatrixPresent
+        ? _readScalingLists(br, count)
+        : _absentScalingLists(count);
   }
 
   final log2MaxFrameNumMinus4 = readUE(br);
+  if (log2MaxFrameNumMinus4 > 12) {
+    throw FormatException(
+      'log2_max_frame_num_minus4=$log2MaxFrameNumMinus4 exceeds 12',
+    );
+  }
   final picOrderCntType = readUE(br);
   var log2MaxPicOrderCntLsbMinus4 = 0;
   var deltaPicOrderAlwaysZeroFlag = false;
 
   if (picOrderCntType == 0) {
     log2MaxPicOrderCntLsbMinus4 = readUE(br);
+    if (log2MaxPicOrderCntLsbMinus4 > 12) {
+      throw FormatException(
+        'log2_max_pic_order_cnt_lsb_minus4='
+        '$log2MaxPicOrderCntLsbMinus4 exceeds 12',
+      );
+    }
   } else if (picOrderCntType == 1) {
     deltaPicOrderAlwaysZeroFlag = br.readBit() == 1;
     readSE(br); // offset_for_non_ref_pic
@@ -167,6 +211,14 @@ SpsInfo parseSpsNal(Uint8List nal) {
   }
 
   final maxNumRefFrames = readUE(br);
+  // Annex A derives MaxDpbFrames with an absolute maximum of 16 frame
+  // pictures. Reject an invalid larger value here so it can never become an
+  // unbounded retained-picture budget in a streaming decoder.
+  if (maxNumRefFrames > 16) {
+    throw FormatException(
+      'max_num_ref_frames=$maxNumRefFrames exceeds the H.264 maximum of 16',
+    );
+  }
   final gapsInFrameNumValueAllowedFlag = br.readBit() == 1;
   final picWidthInMbsMinus1 = readUE(br);
   final picHeightInMapUnitsMinus1 = readUE(br);
@@ -216,6 +268,7 @@ SpsInfo parseSpsNal(Uint8List nal) {
     bitDepthChromaMinus8: bitDepthChromaMinus8,
     qpprimeYZeroTransformBypassFlag: qpprimeYZeroTransformBypassFlag,
     scalingMatrixPresent: scalingMatrixPresent,
+    scalingLists: List<H264ScalingListSyntax>.unmodifiable(scalingLists),
     log2MaxFrameNumMinus4: log2MaxFrameNumMinus4,
     picOrderCntType: picOrderCntType,
     log2MaxPicOrderCntLsbMinus4: log2MaxPicOrderCntLsbMinus4,
@@ -266,13 +319,19 @@ bool _hasExtendedProfileSyntax(int profileIdc) => const <int>{
   return (subWidthC, subHeightC * (frameMbsOnlyFlag ? 1 : 2));
 }
 
-void _skipScalingList(BitReader br, int size) {
-  var lastScale = 8;
-  var nextScale = 8;
-  for (var j = 0; j < size; j++) {
-    if (nextScale != 0) {
-      nextScale = (lastScale + readSE(br)) & 0xff;
-    }
-    if (nextScale != 0) lastScale = nextScale;
-  }
+List<H264ScalingListSyntax> _readScalingLists(BitReader reader, int count) {
+  return <H264ScalingListSyntax>[
+    for (var index = 0; index < count; index++)
+      if (reader.readBit() == 1)
+        H264ScalingListSyntax.parse(reader, size: index < 6 ? 16 : 64)
+      else
+        H264ScalingListSyntax.absent(index < 6 ? 16 : 64),
+  ];
+}
+
+List<H264ScalingListSyntax> _absentScalingLists(int count) {
+  return <H264ScalingListSyntax>[
+    for (var index = 0; index < count; index++)
+      H264ScalingListSyntax.absent(index < 6 ? 16 : 64),
+  ];
 }

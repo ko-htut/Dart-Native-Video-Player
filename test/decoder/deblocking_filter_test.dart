@@ -335,6 +335,179 @@ void main() {
     });
 
     test(
+      'transform8x8 skips luma edges 4 and 12 but keeps edge 8 and chroma',
+      () {
+        const bands = <int>[
+          100,
+          100,
+          102,
+          105,
+          112,
+          114,
+          116,
+          116,
+          120,
+          122,
+          124,
+          124,
+          132,
+          134,
+          136,
+          136,
+        ];
+        final originalLuma = Uint8List(16 * 16);
+        for (var y = 0; y < 16; y++) {
+          originalLuma.setRange(y * 16, y * 16 + 16, bands);
+        }
+        final luma = Uint8List.fromList(originalLuma);
+        final cb = Uint8List(8 * 8);
+        final cr = Uint8List(8 * 8);
+        for (var y = 0; y < 8; y++) {
+          cb.setRange(y * 8, y * 8 + 8, const <int>[
+            100,
+            100,
+            102,
+            105,
+            112,
+            114,
+            116,
+            116,
+          ]);
+          cr.setRange(y * 8, y * 8 + 8, const <int>[
+            100,
+            100,
+            102,
+            105,
+            112,
+            114,
+            116,
+            116,
+          ]);
+        }
+        final originalCb = Uint8List.fromList(cb);
+        final originalCr = Uint8List.fromList(cr);
+
+        H264DeblockingFilter.apply420(
+          luma: luma,
+          cb: cb,
+          cr: cr,
+          codedWidth: 16,
+          codedHeight: 16,
+          macroblocks: <H264DeblockingMacroblock>[
+            _macroblock(intra: true, qp: 40, transformSize8x8: true),
+          ],
+        );
+
+        // The samples adjoining offsets 4 and 12 remain untouched.
+        expect(luma.sublist(2, 6), originalLuma.sublist(2, 6));
+        expect(luma.sublist(10, 14), originalLuma.sublist(10, 14));
+        // The retained luma edge at offset 8 and its matching chroma edge are
+        // still filtered.
+        expect(luma.sublist(6, 10), isNot(originalLuma.sublist(6, 10)));
+        expect(cb, isNot(originalCb));
+        expect(cr, isNot(originalCr));
+      },
+    );
+
+    test('transform8x8 applies the same odd-edge rule horizontally', () {
+      const bands = <int>[
+        100,
+        100,
+        102,
+        105,
+        112,
+        114,
+        116,
+        116,
+        120,
+        122,
+        124,
+        124,
+        132,
+        134,
+        136,
+        136,
+      ];
+      final originalLuma = Uint8List(16 * 16);
+      for (var y = 0; y < 16; y++) {
+        originalLuma.fillRange(y * 16, y * 16 + 16, bands[y]);
+      }
+      final luma = Uint8List.fromList(originalLuma);
+      final cb = Uint8List(8 * 8);
+      final cr = Uint8List(8 * 8);
+      const chromaBands = <int>[100, 100, 102, 105, 112, 114, 116, 116];
+      for (var y = 0; y < 8; y++) {
+        cb.fillRange(y * 8, y * 8 + 8, chromaBands[y]);
+        cr.fillRange(y * 8, y * 8 + 8, chromaBands[y]);
+      }
+      final originalCb = Uint8List.fromList(cb);
+      final originalCr = Uint8List.fromList(cr);
+
+      H264DeblockingFilter.apply420(
+        luma: luma,
+        cb: cb,
+        cr: cr,
+        codedWidth: 16,
+        codedHeight: 16,
+        macroblocks: <H264DeblockingMacroblock>[
+          _macroblock(intra: true, qp: 40, transformSize8x8: true),
+        ],
+      );
+
+      List<int> column(int start, int end) => <int>[
+        for (var y = start; y < end; y++) luma[y * 16],
+      ];
+      List<int> originalColumn(int start, int end) => <int>[
+        for (var y = start; y < end; y++) originalLuma[y * 16],
+      ];
+      expect(column(2, 6), originalColumn(2, 6));
+      expect(column(10, 14), originalColumn(10, 14));
+      expect(column(6, 10), isNot(originalColumn(6, 10)));
+      expect(cb, isNot(originalCb));
+      expect(cr, isNot(originalCr));
+    });
+
+    test('transform8x8 keeps the external luma and chroma edges enabled', () {
+      final luma = Uint8List(32 * 16);
+      for (var y = 0; y < 16; y++) {
+        luma.fillRange(y * 32, y * 32 + 13, 90);
+        luma.setRange(y * 32 + 13, y * 32 + 19, const <int>[
+          94,
+          98,
+          100,
+          104,
+          106,
+          108,
+        ]);
+        luma.fillRange(y * 32 + 19, y * 32 + 32, 112);
+      }
+      final cb = Uint8List(16 * 8);
+      final cr = Uint8List(16 * 8);
+      for (var y = 0; y < 8; y++) {
+        cb.fillRange(y * 16, y * 16 + 6, 98);
+        cb.setRange(y * 16 + 6, y * 16 + 10, const <int>[98, 100, 104, 108]);
+        cb.fillRange(y * 16 + 10, y * 16 + 16, 108);
+        cr.setRange(y * 16, y * 16 + 16, cb, y * 16);
+      }
+
+      H264DeblockingFilter.apply420(
+        luma: luma,
+        cb: cb,
+        cr: cr,
+        codedWidth: 32,
+        codedHeight: 16,
+        macroblocks: <H264DeblockingMacroblock>[
+          _macroblock(intra: true, qp: 40),
+          _macroblock(intra: true, qp: 40, transformSize8x8: true),
+        ],
+      );
+
+      expect(luma.sublist(13, 19), <int>[96, 99, 101, 103, 105, 107]);
+      expect(cb.sublist(6, 10), <int>[98, 101, 105, 108]);
+      expect(cr.sublist(6, 10), <int>[98, 101, 105, 108]);
+    });
+
+    test(
       'disable_deblocking_filter_idc=1 leaves all planes byte-identical',
       () {
         final luma = Uint8List.fromList(List<int>.generate(256, (i) => i));
@@ -464,6 +637,7 @@ H264DeblockingMacroblock _macroblock({
   bool intra = false,
   int qp = 0,
   int sliceId = 0,
+  bool transformSize8x8 = false,
   Set<int> residualBlockIndexes = const <int>{},
 }) {
   return H264DeblockingMacroblock(
@@ -472,6 +646,7 @@ H264DeblockingMacroblock _macroblock({
     qpCb: qp,
     qpCr: qp,
     sliceId: sliceId,
+    transformSize8x8: transformSize8x8,
     lumaBlocks: List<H264DeblockingBlock>.generate(
       16,
       (index) => H264DeblockingBlock(

@@ -17,17 +17,30 @@ class Yuv420Frame {
 }
 
 Uint8List yuv420ToRgba(Yuv420Frame f) {
+  return yuv420ToRgbaScaled(f, f.width, f.height);
+}
+
+/// Converts planar YUV420 directly into an RGBA buffer of [outputWidth] by
+/// [outputHeight], using nearest-neighbour sampling while colors are expanded.
+/// This avoids allocating a full-resolution RGBA intermediate when an HLS
+/// rendition advertises a smaller display size than its encoded SPS.
+Uint8List yuv420ToRgbaScaled(Yuv420Frame f, int outputWidth, int outputHeight) {
+  if (outputWidth <= 0 || outputHeight <= 0) {
+    throw ArgumentError('RGBA output dimensions must be positive');
+  }
   final w = f.width;
   final h = f.height;
-  final out = Uint8List(w * h * 4);
+  final out = Uint8List(outputWidth * outputHeight * 4);
 
   int o = 0;
-  for (int j = 0; j < h; j++) {
-    final uvRow = (j >> 1) * (w >> 1);
-    final yRow = j * w;
-    for (int i = 0; i < w; i++) {
-      final yVal = f.y[yRow + i];
-      final uvIndex = uvRow + (i >> 1);
+  for (int j = 0; j < outputHeight; j++) {
+    final sourceY = j * h ~/ outputHeight;
+    final uvRow = (sourceY >> 1) * (w >> 1);
+    final yRow = sourceY * w;
+    for (int i = 0; i < outputWidth; i++) {
+      final sourceX = i * w ~/ outputWidth;
+      final yVal = f.y[yRow + sourceX];
+      final uvIndex = uvRow + (sourceX >> 1);
       final uVal = f.u[uvIndex];
       final vVal = f.v[uvIndex];
 
