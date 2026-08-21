@@ -31,6 +31,29 @@ final class AndroidH264QueueReceipt {
   final String decoderName;
 }
 
+/// Decoder limits reported by Android's selected AVC codec.
+final class AndroidH264Capabilities {
+  const AndroidH264Capabilities({
+    required this.supported,
+    required this.hardwareAccelerated,
+    required this.decoderName,
+    required this.maximumWidth,
+    required this.maximumHeight,
+    required this.maximumFrameRate,
+    required this.maximumBitrate,
+  });
+
+  final bool supported;
+  final bool hardwareAccelerated;
+  final String decoderName;
+  final int maximumWidth;
+  final int maximumHeight;
+  final double maximumFrameRate;
+  final int maximumBitrate;
+
+  int get maximumPixels => maximumWidth * maximumHeight;
+}
+
 /// Android MediaCodec H.264 decoder whose output is a Flutter texture.
 ///
 /// The Dart HLS/MP4 demuxers still own compressed access-unit order. Native
@@ -72,8 +95,26 @@ final class AndroidH264TextureDecoder {
   bool get isConfigured => _textureId != null;
 
   Future<bool> isSupported() async {
+    return (await capabilities()).supported;
+  }
+
+  Future<AndroidH264Capabilities> capabilities() async {
     _ensureActive();
-    return await _channel.invokeMethod<bool>('isSupported') ?? false;
+    final response = await _channel.invokeMapMethod<String, Object?>(
+      'getCapabilities',
+    );
+    if (response == null) {
+      throw StateError('Android returned no H.264 decoder capabilities');
+    }
+    return AndroidH264Capabilities(
+      supported: response['supported'] as bool? ?? false,
+      hardwareAccelerated: response['hardwareAccelerated'] as bool? ?? false,
+      decoderName: response['decoderName'] as String? ?? 'MediaCodec',
+      maximumWidth: response['maximumWidth'] as int? ?? 0,
+      maximumHeight: response['maximumHeight'] as int? ?? 0,
+      maximumFrameRate: (response['maximumFrameRate'] as num?)?.toDouble() ?? 0,
+      maximumBitrate: response['maximumBitrate'] as int? ?? 0,
+    );
   }
 
   /// Queues one access unit and lazily configures MediaCodec from its SPS/PPS.

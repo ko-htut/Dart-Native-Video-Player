@@ -7,6 +7,7 @@ import android.media.MediaFormat
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.os.Build
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
@@ -32,6 +33,7 @@ class MainActivity : FlutterActivity() {
         channel.setMethodCallHandler { call, result ->
             when (call.method) {
                 "isSupported" -> result.success(decoder.isSupported())
+                "getCapabilities" -> result.success(decoder.capabilities())
                 "configure" -> configureDecoder(decoder, call, result)
                 "queueAccessUnit" -> queueAccessUnit(decoder, call, result)
                 "setClock" -> {
@@ -136,11 +138,38 @@ private class H264TextureDecoder(
     private var disposed = false
     private var lastFrameEventNs = Long.MIN_VALUE
 
-    fun isSupported(): Boolean = try {
-        val format = MediaFormat.createVideoFormat(MIME, 16, 16)
-        MediaCodecList(MediaCodecList.ALL_CODECS).findDecoderForFormat(format) != null
+    fun isSupported(): Boolean = capabilities()["supported"] == true
+
+    fun capabilities(): Map<String, Any> = try {
+        val codecInfo = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
+            .firstOrNull { info ->
+                !info.isEncoder && info.supportedTypes.any { type ->
+                    type.equals(MIME, ignoreCase = true)
+                }
+            }
+        if (codecInfo == null) {
+            mapOf("supported" to false)
+        } else {
+            val video = codecInfo.getCapabilitiesForType(MIME).videoCapabilities
+            val hardwareAccelerated = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                codecInfo.isHardwareAccelerated
+            } else {
+                val normalized = codecInfo.name.lowercase()
+                !normalized.startsWith("omx.google.") &&
+                    !normalized.startsWith("c2.android.")
+            }
+            mapOf(
+                "supported" to true,
+                "hardwareAccelerated" to hardwareAccelerated,
+                "decoderName" to codecInfo.name,
+                "maximumWidth" to video.supportedWidths.upper,
+                "maximumHeight" to video.supportedHeights.upper,
+                "maximumFrameRate" to video.supportedFrameRates.upper,
+                "maximumBitrate" to video.bitrateRange.upper,
+            )
+        }
     } catch (_: Throwable) {
-        false
+        mapOf("supported" to false)
     }
 
     fun configure(

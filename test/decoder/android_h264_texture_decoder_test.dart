@@ -14,7 +14,15 @@ void main() {
         .setMockMethodCallHandler(channel, (call) async {
           calls.add(call);
           return switch (call.method) {
-            'isSupported' => true,
+            'getCapabilities' => <String, Object?>{
+              'supported': true,
+              'hardwareAccelerated': true,
+              'decoderName': 'test.avc.decoder',
+              'maximumWidth': 3840,
+              'maximumHeight': 2160,
+              'maximumFrameRate': 60.0,
+              'maximumBitrate': 50000000,
+            },
             'configure' => <String, Object?>{
               'textureId': 91,
               'width': 1236,
@@ -36,7 +44,11 @@ void main() {
     final decoder = AndroidH264TextureDecoder(channel: channel);
     addTearDown(decoder.dispose);
 
-    expect(await decoder.isSupported(), isTrue);
+    final capabilities = await decoder.capabilities();
+    expect(capabilities.supported, isTrue);
+    expect(capabilities.hardwareAccelerated, isTrue);
+    expect(capabilities.maximumPixels, 3840 * 2160);
+    expect(capabilities.maximumFrameRate, 60);
     final receipt = await decoder.queueAccessUnit(
       nals: <Uint8List>[_sps, _pps, _idr],
       presentationTimeUs: 123000,
