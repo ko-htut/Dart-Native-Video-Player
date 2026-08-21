@@ -50,7 +50,25 @@ final class HlsQualityController {
   HlsQualityController({
     required Iterable<HlsQualityRendition> renditions,
     Uri? initialManualVariantUri,
+    int? maximumAutomaticPixels,
+    int? maximumAutomaticBandwidth,
   }) : _renditions = _validateAndSortRenditions(renditions) {
+    if (maximumAutomaticPixels != null && maximumAutomaticPixels <= 0) {
+      throw ArgumentError.value(
+        maximumAutomaticPixels,
+        'maximumAutomaticPixels',
+      );
+    }
+    if (maximumAutomaticBandwidth != null && maximumAutomaticBandwidth <= 0) {
+      throw ArgumentError.value(
+        maximumAutomaticBandwidth,
+        'maximumAutomaticBandwidth',
+      );
+    }
+    _maximumAutomaticIndex = _deriveMaximumAutomaticIndex(
+      maximumPixels: maximumAutomaticPixels,
+      maximumBandwidth: maximumAutomaticBandwidth,
+    );
     final manualUri = initialManualVariantUri;
     if (manualUri != null) {
       final manualIndex = _indexForUri(manualUri);
@@ -66,20 +84,32 @@ final class HlsQualityController {
     }
   }
 
-  static const double _safeThroughputFraction = 0.65;
-  static const int _fastDownloadsBeforeUpgrade = 3;
+  static const double _safeThroughputFraction = 0.72;
+  static const int _fastDownloadsBeforeUpgrade = 4;
   static const int _smoothPresentationsToRecover = 90;
   static const int _troubledPresentationsBeforeFurtherStepDown = 3;
   static const int _latePlaybackThresholdMs = 180;
   static const int _smoothPlaybackThresholdMs = 60;
+  static const int _criticalBufferMs = 1200;
+  static const int _lowBufferMs = 3000;
+  static const int _upgradeBufferMs = 8000;
+  static const int _healthyBufferSamplesToRecover = 8;
+  static const int _upgradeCooldownDownloadsAfterTrouble = 6;
 
   final List<HlsQualityRendition> _renditions;
   HlsQualityMode _mode = HlsQualityMode.automatic;
   int _selectedIndex = 0;
+  late final int _maximumAutomaticIndex;
   double? _estimatedBitsPerSecond;
+  double? _fastEstimatedBitsPerSecond;
+  double? _slowEstimatedBitsPerSecond;
   int _consecutiveFastDownloads = 0;
   int _smoothPresentations = 0;
   int _consecutiveTroubledPresentations = 0;
+  int _consecutiveLowBufferSamples = 0;
+  int _healthyBufferSamples = 0;
+  int _upgradeCooldownDownloads = 0;
+  int? _bufferAheadMs;
   bool _playbackConstrained = false;
 
   HlsQualityMode get mode => _mode;
@@ -88,6 +118,9 @@ final class HlsQualityController {
   HlsQualityRendition get canonical => _renditions.first;
   double? get estimatedBitsPerSecond => _estimatedBitsPerSecond;
   bool get playbackConstrained => _playbackConstrained;
+  int? get bufferAheadMs => _bufferAheadMs;
+  HlsQualityRendition get automaticCeiling =>
+      _renditions[_maximumAutomaticIndex];
 
   HlsQualityChange? selectAutomatic() {
     final previous = selected;
@@ -129,27 +162,45 @@ final class HlsQualityController {
   HlsQualityChange? recordDownload({
     required int byteCount,
     required Duration elapsed,
+    Duration? segmentDuration,
   }) {
     if (byteCount < 0) {
       throw ArgumentError.value(byteCount, 'byteCount');
     }
     final elapsedUs = elapsed.inMicroseconds <= 0 ? 1 : elapsed.inMicroseconds;
     final sample = byteCount * 8 * Duration.microsecondsPerSecond / elapsedUs;
-    final previousEstimate = _estimatedBitsPerSecond;
-    _estimatedBitsPerSecond = previousEstimate == null
+    _fastEstimatedBitsPerSecond = _fastEstimatedBitsPerSecond == null
         ? sample
-        : previousEstimate * 0.7 + sample * 0.3;
+        : _fastEstimatedBitsPerSecond! * 0.5 + sample * 0.5;
+    _slowEstimatedBitsPerSecond = _slowEstimatedBitsPerSecond == null
+        ? sample
+        : _slowEstimatedBitsPerSecond! * 0.8 + sample * 0.2;
+    _estimatedBitsPerSecond =
+        _fastEstimatedBitsPerSecond! < _slowEstimatedBitsPerSecond!
+        ? _fastEstimatedBitsPerSecond
+        : _slowEstimatedBitsPerSecond;
     if (_mode == HlsQualityMode.manual) return null;
+
+    if (_upgradeCooldownDownloads > 0) _upgradeCooldownDownloads--;
 
     final currentBandwidth = selected.bandwidth;
     final estimate = _estimatedBitsPerSecond!;
+    final durationUs = segmentDuration?.inMicroseconds;
+    final downloadTooSlowForRealtime =
+        durationUs != null &&
+        durationUs > 0 &&
+        elapsedUs * 100 > durationUs * 90;
     if (_selectedIndex > 0 &&
         currentBandwidth > 0 &&
-        estimate < currentBandwidth * 1.10) {
+        (estimate < currentBandwidth * 1.10 || downloadTooSlowForRealtime)) {
       _consecutiveFastDownloads = 0;
+      _markPlaybackTrouble();
       return _stepDown('measured bandwidth fell below the safety margin');
     }
-    if (_playbackConstrained || _selectedIndex >= _renditions.length - 1) {
+    if (_playbackConstrained ||
+        _upgradeCooldownDownloads > 0 ||
+        _selectedIndex >= _maximumAutomaticIndex ||
+        (_bufferAheadMs ?? 0) < _upgradeBufferMs) {
       _consecutiveFastDownloads = 0;
       return null;
     }
@@ -171,7 +222,69 @@ final class HlsQualityController {
   HlsQualityChange? recordNetworkFailure() {
     if (_mode == HlsQualityMode.manual) return null;
     _consecutiveFastDownloads = 0;
+    _markPlaybackTrouble();
     return _stepDown('segment download failed');
+  }
+
+  /// Updates queue health independently from decode-presentation cadence.
+  ///
+  /// [videoBufferedMs] is compressed video available beyond the audio clock;
+  /// [audioBufferedMs], when present, is the matching PCM window. The smaller
+  /// value is authoritative because either side can stall playback.
+  HlsQualityChange? observeBuffer({
+    required int videoBufferedMs,
+    int? audioBufferedMs,
+    required bool playing,
+    bool starved = false,
+  }) {
+    if (videoBufferedMs < 0) {
+      throw ArgumentError.value(videoBufferedMs, 'videoBufferedMs');
+    }
+    if (audioBufferedMs != null && audioBufferedMs < 0) {
+      throw ArgumentError.value(audioBufferedMs, 'audioBufferedMs');
+    }
+    final bufferedMs = audioBufferedMs == null
+        ? videoBufferedMs
+        : (videoBufferedMs < audioBufferedMs
+              ? videoBufferedMs
+              : audioBufferedMs);
+    _bufferAheadMs = bufferedMs;
+    if (_mode == HlsQualityMode.manual) return null;
+
+    if (starved || (playing && bufferedMs <= _criticalBufferMs)) {
+      _consecutiveLowBufferSamples = 0;
+      _markPlaybackTrouble();
+      return _stepDownBy(
+        starved ? 2 : 1,
+        starved
+            ? 'playback buffer starved'
+            : 'playback buffer fell to ${bufferedMs}ms',
+      );
+    }
+
+    if (playing && bufferedMs < _lowBufferMs) {
+      _healthyBufferSamples = 0;
+      _consecutiveLowBufferSamples++;
+      _consecutiveFastDownloads = 0;
+      if (_consecutiveLowBufferSamples >= 2) {
+        _consecutiveLowBufferSamples = 0;
+        _markPlaybackTrouble();
+        return _stepDown('playback buffer stayed below ${_lowBufferMs}ms');
+      }
+      return null;
+    }
+
+    _consecutiveLowBufferSamples = 0;
+    if (bufferedMs >= _upgradeBufferMs) {
+      _healthyBufferSamples++;
+      if (_healthyBufferSamples >= _healthyBufferSamplesToRecover) {
+        _playbackConstrained = false;
+        _healthyBufferSamples = 0;
+      }
+    } else {
+      _healthyBufferSamples = 0;
+    }
+    return null;
   }
 
   /// Feeds audio-clock lateness and starvation into automatic hysteresis.
@@ -193,7 +306,7 @@ final class HlsQualityController {
               _troubledPresentationsBeforeFurtherStepDown) {
         return null;
       }
-      _playbackConstrained = true;
+      _markPlaybackTrouble();
       _consecutiveTroubledPresentations = 0;
       return _stepDown(
         starved
@@ -252,7 +365,17 @@ final class HlsQualityController {
     _consecutiveFastDownloads = 0;
     _smoothPresentations = 0;
     _consecutiveTroubledPresentations = 0;
+    _consecutiveLowBufferSamples = 0;
+    _healthyBufferSamples = 0;
+    _upgradeCooldownDownloads = 0;
+    _bufferAheadMs = null;
     _playbackConstrained = false;
+  }
+
+  void _markPlaybackTrouble() {
+    _playbackConstrained = true;
+    _healthyBufferSamples = 0;
+    _upgradeCooldownDownloads = _upgradeCooldownDownloadsAfterTrouble;
   }
 
   HlsQualityChange? _stepDown(String reason) {
@@ -266,8 +389,19 @@ final class HlsQualityController {
     );
   }
 
+  HlsQualityChange? _stepDownBy(int levels, String reason) {
+    if (_selectedIndex == 0) return null;
+    final previous = selected;
+    _selectedIndex = (_selectedIndex - levels).clamp(0, _selectedIndex);
+    return HlsQualityChange(
+      previous: previous,
+      current: selected,
+      reason: reason,
+    );
+  }
+
   HlsQualityChange? _stepUp(String reason) {
-    if (_selectedIndex >= _renditions.length - 1) return null;
+    if (_selectedIndex >= _maximumAutomaticIndex) return null;
     final previous = selected;
     _selectedIndex++;
     return HlsQualityChange(
@@ -276,6 +410,40 @@ final class HlsQualityController {
       reason: reason,
     );
   }
+
+  int _deriveMaximumAutomaticIndex({
+    required int? maximumPixels,
+    required int? maximumBandwidth,
+  }) {
+    var ceiling = 0;
+    for (var index = 0; index < _renditions.length; index++) {
+      final rendition = _renditions[index];
+      final bandwidth = rendition.bandwidth;
+      if (maximumBandwidth != null &&
+          bandwidth > 0 &&
+          bandwidth > maximumBandwidth) {
+        continue;
+      }
+      final pixels = _resolutionPixels(rendition.variant.resolution);
+      if (maximumPixels != null) {
+        if (pixels == null || pixels > maximumPixels) continue;
+      }
+      ceiling = index;
+    }
+    return ceiling;
+  }
+}
+
+int? _resolutionPixels(String? resolution) {
+  if (resolution == null) return null;
+  final separator = resolution.toLowerCase().indexOf('x');
+  if (separator <= 0 || separator >= resolution.length - 1) return null;
+  final width = int.tryParse(resolution.substring(0, separator));
+  final height = int.tryParse(resolution.substring(separator + 1));
+  if (width == null || height == null || width <= 0 || height <= 0) {
+    return null;
+  }
+  return width * height;
 }
 
 final class HlsResolvedQualitySegment {
@@ -394,6 +562,9 @@ final class HlsAdaptiveSegmentFetcher {
       final decision = controller.recordDownload(
         byteCount: bytes.length,
         elapsed: elapsed,
+        segmentDuration: Duration(
+          microseconds: (resolved.segment!.duration * 1000000).round(),
+        ),
       );
       if (decision != null) onDecision?.call(decision);
       return bytes;

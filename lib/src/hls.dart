@@ -83,6 +83,25 @@ final class HlsDiscontinuityUnsupportedException implements Exception {
       'across #EXT-X-DISCONTINUITY is not supported yet.';
 }
 
+/// A playlist feature that cannot be represented by the MPEG-TS pipeline.
+///
+/// Rejecting these tags before fetching media avoids treating encrypted,
+/// fragmented-MP4, sparse, or byte-range data as a complete clear TS segment.
+final class HlsMediaFeatureUnsupportedException implements Exception {
+  const HlsMediaFeatureUnsupportedException({
+    required this.playlistUri,
+    required this.feature,
+  });
+
+  final Uri playlistUri;
+  final String feature;
+
+  @override
+  String toString() =>
+      'HlsMediaFeatureUnsupportedException: $playlistUri uses unsupported '
+      'HLS feature $feature';
+}
+
 /// Requires every segment in [playlist] to share one timestamp epoch.
 ///
 /// A non-zero initial discontinuity sequence is valid; only an epoch change
@@ -123,6 +142,35 @@ bool hlsVariantAdvertisesHeAac(HlsVariant variant) =>
       final normalized = codec.toLowerCase();
       return normalized == 'mp4a.40.5' || normalized == 'mp4a.40.29';
     });
+
+/// Returns a reason when `CODECS` explicitly advertises a non-AVC video
+/// stream. Missing/ambiguous codec metadata remains probeable from the TS
+/// parameter sets; explicit HEVC, AV1, VP9, and Dolby Vision fail early.
+String? hlsVariantUnsupportedVideoCodecReason(HlsVariant variant) {
+  final ids = hlsVariantCodecIds(
+    variant,
+  ).map((codec) => codec.toLowerCase()).toList(growable: false);
+  final videoIds = ids.where(
+    (codec) =>
+        codec.startsWith('avc1.') ||
+        codec.startsWith('avc3.') ||
+        codec.startsWith('hvc1.') ||
+        codec.startsWith('hev1.') ||
+        codec.startsWith('av01.') ||
+        codec.startsWith('vp09.') ||
+        codec.startsWith('dvh1.') ||
+        codec.startsWith('dvhe.'),
+  );
+  if (videoIds.isEmpty) return null;
+  final unsupported = videoIds
+      .where(
+        (codec) => !codec.startsWith('avc1.') && !codec.startsWith('avc3.'),
+      )
+      .toList(growable: false);
+  return unsupported.isEmpty
+      ? null
+      : 'unsupported advertised video codec ${unsupported.join(', ')}';
+}
 
 /// Picks the cheapest AAC-LC rendition, preferring [preferred] when it already
 /// carries AAC-LC.
@@ -311,6 +359,8 @@ Future<List<HlsVariant>> fetchHlsVariants(
       .where((l) => l.isNotEmpty)
       .toList();
 
+  _rejectUnsupportedHlsTags(masterUrl, lines, master: true);
+
   final variants = <HlsVariant>[];
   for (int i = 0; i < lines.length; i++) {
     final line = lines[i];
@@ -344,6 +394,8 @@ Future<HlsMediaPlaylist> fetchMediaPlaylist(
 }) async {
   final text = await fetchText(playlistUrl, byteFetcher: byteFetcher);
   final lines = text.split('\n').map((l) => l.trim()).toList();
+
+  _rejectUnsupportedHlsTags(playlistUrl, lines, master: false);
 
   int target = 0;
   int mediaSeq = 0;
@@ -401,6 +453,42 @@ Future<HlsMediaPlaylist> fetchMediaPlaylist(
     throw HlsVodPlaylistRequiredException(playlistUrl);
   }
   return playlist;
+}
+
+void _rejectUnsupportedHlsTags(
+  Uri playlistUri,
+  Iterable<String> lines, {
+  required bool master,
+}) {
+  for (final line in lines) {
+    if (line.startsWith('#EXT-X-KEY:') ||
+        line.startsWith('#EXT-X-SESSION-KEY:')) {
+      final attributes = _parseAttrs(line.substring(line.indexOf(':') + 1));
+      final method = attributes['METHOD']?.replaceAll('"', '').toUpperCase();
+      if (method != 'NONE') {
+        throw HlsMediaFeatureUnsupportedException(
+          playlistUri: playlistUri,
+          feature: 'encrypted media (METHOD=${method ?? "missing"})',
+        );
+      }
+    }
+    if (master) continue;
+    final feature = switch (line) {
+      final value when value.startsWith('#EXT-X-MAP:') =>
+        'fragmented MP4 initialization maps',
+      final value when value.startsWith('#EXT-X-BYTERANGE:') =>
+        'byte-range media segments',
+      '#EXT-X-GAP' => 'gap segments',
+      '#EXT-X-I-FRAMES-ONLY' => 'I-frame-only media',
+      _ => null,
+    };
+    if (feature != null) {
+      throw HlsMediaFeatureUnsupportedException(
+        playlistUri: playlistUri,
+        feature: feature,
+      );
+    }
+  }
 }
 
 Map<String, String> _parseAttrs(String s) {

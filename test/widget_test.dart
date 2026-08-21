@@ -86,4 +86,30 @@ void main() {
       isNotNull,
     );
   });
+
+  testWidgets('app lifecycle pause and resume keep the player mounted', (
+    tester,
+  ) async {
+    await tester.pumpWidget(const App());
+
+    for (final state in <AppLifecycleState>[
+      AppLifecycleState.inactive,
+      AppLifecycleState.hidden,
+      AppLifecycleState.paused,
+    ]) {
+      tester.binding.handleAppLifecycleStateChanged(state);
+      await tester.pump();
+    }
+    expect(find.textContaining('Paused in background'), findsOneWidget);
+
+    for (final state in <AppLifecycleState>[
+      AppLifecycleState.hidden,
+      AppLifecycleState.inactive,
+      AppLifecycleState.resumed,
+    ]) {
+      tester.binding.handleAppLifecycleStateChanged(state);
+      await tester.pump();
+    }
+    expect(find.byKey(const Key('playback-health')), findsOneWidget);
+  });
 }

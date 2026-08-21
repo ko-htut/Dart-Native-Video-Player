@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:io' as io;
 import 'dart:math' as math;
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
@@ -21,7 +22,9 @@ import 'src/ts_pes.dart';
 import 'src/pes_pts.dart';
 import 'src/access_unit_pts.dart';
 import 'src/player_clock.dart';
+import 'src/playback_reliability.dart';
 import 'src/decoder/h264_decode_worker.dart';
+import 'src/decoder/android_h264_texture_decoder.dart';
 import 'src/decoder/pps.dart';
 import 'src/decoder/slice_header.dart';
 import 'src/decoder/sps.dart';
@@ -65,19 +68,50 @@ final class _DetachedHlsResources {
 }
 
 final class _PresentedVideoFrame {
-  const _PresentedVideoFrame({
+  const _PresentedVideoFrame.software({
     required this.accessUnit,
     required this.rgba,
     required this.width,
     required this.height,
     required this.decodeInfo,
-  });
+  }) : textureId = null;
+
+  const _PresentedVideoFrame.hardware({
+    required this.accessUnit,
+    required this.textureId,
+    required this.width,
+    required this.height,
+    required this.decodeInfo,
+  }) : rgba = null;
 
   final TimestampedAccessUnit accessUnit;
-  final Uint8List rgba;
+  final Uint8List? rgba;
+  final int? textureId;
   final int width;
   final int height;
   final String decodeInfo;
+}
+
+sealed class _VideoDecodeResult {
+  const _VideoDecodeResult();
+}
+
+final class _SoftwareVideoDecodeResult extends _VideoDecodeResult {
+  const _SoftwareVideoDecodeResult(this.decoded);
+
+  final H264WorkerDecodeResult decoded;
+}
+
+final class _HardwareVideoDecodeResult extends _VideoDecodeResult {
+  const _HardwareVideoDecodeResult(this.receipt);
+
+  final AndroidH264QueueReceipt receipt;
+}
+
+final class _HardwareFallbackPending implements Exception {
+  const _HardwareFallbackPending(this.cause);
+
+  final Object cause;
 }
 
 bool _shouldRetryHlsSegment(Object error) {
@@ -100,7 +134,8 @@ class PureDartPlaybackScreen extends StatefulWidget {
   State<PureDartPlaybackScreen> createState() => _PureDartPlaybackScreenState();
 }
 
-class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
+class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen>
+    with WidgetsBindingObserver {
   final urlCtrl = TextEditingController(
     // --- MP4 (use "Build Queue (MP4)" button) ---
     // text: 'assets/butterfly_dart.mp4',
@@ -125,10 +160,36 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
   TimestampedAccessUnit? current;
 
   final decoder = H264DecodeWorker();
+  final AndroidH264TextureDecoder? hardwareDecoder = io.Platform.isAndroid
+      ? AndroidH264TextureDecoder()
+      : null;
   final frameRenderer = YuvRgbaRenderWorker();
-  late SequentialDecodePump<TimestampedAccessUnit, H264WorkerDecodeResult>
+  late SequentialDecodePump<TimestampedAccessUnit, _VideoDecodeResult>
   _decodePump;
   bool _hasDecodePump = false;
+  bool _hardwareVideoSupported = false;
+  bool _hardwareVideoActive = false;
+  AndroidH264Capabilities? _hardwareVideoCapabilities;
+  bool _hardwareFallbackPending = false;
+  Object? _hardwareFallbackCause;
+  StreamSubscription<AndroidH264RenderedFrame>? _hardwareFrames;
+  StreamSubscription<Object>? _hardwareErrors;
+  StreamSubscription<bool>? _hardwareSurfaceAvailability;
+  final SplayTreeMap<int, TimestampedAccessUnit> _hardwareQueuedFrames =
+      SplayTreeMap<int, TimestampedAccessUnit>();
+  String _hardwareDecoderName = 'MediaCodec';
+  final Stopwatch _abrHealthClock = Stopwatch()..start();
+  int _lastAbrHealthSampleMs = -1000;
+  final PlaybackReliabilityTelemetry _telemetry =
+      PlaybackReliabilityTelemetry();
+  final ValueNotifier<String> _telemetryInfo = ValueNotifier<String>(
+    'Health: new session',
+  );
+  AppLifecycleState _appLifecycleState = AppLifecycleState.resumed;
+  bool _lifecycleSuspended = false;
+  bool _resumeAfterLifecycle = false;
+  bool _hardwareSurfaceUnavailable = false;
+  bool _hardwareSurfaceRecoveryRequired = false;
   String decodeInfo = '';
   String audioInfo = 'Audio: none';
 
@@ -169,6 +230,7 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
   static const int _lateNonReferenceBSkipThresholdMs = 100;
   static const int _highResolutionBSkipThresholdMs = 0;
   static const int _highResolutionPixelThreshold = 1280 * 720;
+  static const int _hardwareDecodeLeadMs = 500;
   static const Duration _livePcmRetentionDuration = Duration(minutes: 5);
   static const int _livePcmMaxBytes = 64 * 1024 * 1024;
 
@@ -203,15 +265,133 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
   @override
   void initState() {
     super.initState();
+    _appLifecycleState =
+        WidgetsBinding.instance.lifecycleState ?? AppLifecycleState.resumed;
+    WidgetsBinding.instance.addObserver(this);
+    final hardware = hardwareDecoder;
+    if (hardware != null) {
+      _hardwareFrames = hardware.renderedFrames.listen(
+        _handleHardwareFrameRendered,
+      );
+      _hardwareErrors = hardware.errors.listen(_handleHardwareDecoderError);
+      _hardwareSurfaceAvailability = hardware.surfaceAvailability.listen(
+        _handleHardwareSurfaceAvailability,
+      );
+      unawaited(_probeHardwareVideo(hardware));
+    }
     _configureDecodePump(rolling: false);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _appLifecycleState = state;
+    switch (state) {
+      case AppLifecycleState.resumed:
+        _resumeFromLifecycle();
+        return;
+      case AppLifecycleState.inactive:
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.paused:
+      case AppLifecycleState.detached:
+        _suspendForLifecycle();
+        return;
+    }
+  }
+
+  void _suspendForLifecycle() {
+    if (_lifecycleSuspended) return;
+    _lifecycleSuspended = true;
+    _resumeAfterLifecycle =
+        clock.isPlaying || (_audioController?.isPlaying ?? false);
+    unawaited(
+      _serializeTransport(() async {
+        if (!mounted) return;
+        final audio = _audioController;
+        if (audio != null && audio.isPlaying) await audio.pause();
+        clock.pause();
+        if (mounted) setState(() => decodeInfo = 'Paused in background');
+      }),
+    );
+  }
+
+  void _resumeFromLifecycle() {
+    if (!_lifecycleSuspended && !_hardwareSurfaceRecoveryRequired) return;
+    _lifecycleSuspended = false;
+    if (_hardwareSurfaceUnavailable) return;
+    final shouldResume = _resumeAfterLifecycle;
+    _resumeAfterLifecycle = false;
+    unawaited(
+      _serializeTransport(() async {
+        if (!mounted) return;
+        if (_hardwareSurfaceRecoveryRequired && _hardwareVideoActive) {
+          final targetIndex = _latestAccessUnitAtOrBefore(clock.nowMs);
+          final recovered =
+              targetIndex == null ||
+              await _seekToAccessUnit(
+                targetIndex,
+                resumeAfterSeekOverride: shouldResume,
+              );
+          if (recovered) {
+            _hardwareSurfaceRecoveryRequired = false;
+            _telemetry.recordDecoderRecovery();
+            _publishTelemetry();
+            if (mounted) append('MediaCodec surface restored from keyframe');
+          }
+          return;
+        }
+        if (shouldResume) await _play();
+      }),
+    );
+  }
+
+  void _handleHardwareSurfaceAvailability(bool available) {
+    if (!mounted) return;
+    _hardwareSurfaceUnavailable = !available;
+    if (!available) {
+      _hardwareSurfaceRecoveryRequired = true;
+      _suspendForLifecycle();
+      setState(() => decodeInfo = 'Restoring video surface…');
+      return;
+    }
+    if (_appLifecycleState == AppLifecycleState.resumed) {
+      _resumeFromLifecycle();
+    }
+  }
+
+  void _publishTelemetry() {
+    if (!mounted) return;
+    _telemetry.observeResidentAccessUnits(_decodePump.residentLength);
+    _telemetryInfo.value = _telemetry.summary(
+      droppedFrames: _decodePump.skippedDecodeCount,
+      coalescedFrames: frameRenderer.coalescedFrameCount,
+    );
+  }
+
+  Future<void> _probeHardwareVideo(AndroidH264TextureDecoder hardware) async {
+    try {
+      final capabilities = await hardware.capabilities();
+      if (!mounted) return;
+      _hardwareVideoCapabilities = capabilities;
+      _hardwareVideoSupported = capabilities.supported;
+      if (capabilities.supported) {
+        append(
+          'Android H.264 decoder ${capabilities.decoderName}: '
+          '${capabilities.maximumWidth}x${capabilities.maximumHeight} @ '
+          '${capabilities.maximumFrameRate.toStringAsFixed(0)} fps '
+          '(${capabilities.hardwareAccelerated ? "hardware" : "software"})',
+        );
+      }
+    } catch (error) {
+      if (mounted) append('Hardware H.264 probe failed; using Dart: $error');
+    }
   }
 
   void _configureDecodePump({required bool rolling}) {
     if (_hasDecodePump) _decodePump.dispose();
     _decodePump =
-        SequentialDecodePump<TimestampedAccessUnit, H264WorkerDecodeResult>(
+        SequentialDecodePump<TimestampedAccessUnit, _VideoDecodeResult>(
           timestampOf: (au) => au.ptsMs,
-          decode: (au) => decoder.decodeAccessUnitOrThrow(au.nals),
+          decode: _decodeVideoAccessUnit,
           onLatestDecoded: _presentDecodedFrame,
           onDecodeError: _handleDecodeError,
           onQueueDrained: _handleQueueDrained,
@@ -224,6 +404,7 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
           isDependencyBoundary: rolling ? (au) => au.hasIdr : null,
           presentationMayBeReordered: true,
           shouldSkipDecode: (au, requestedThroughMs) {
+            if (_hardwareVideoActive) return false;
             final resolution = _qualityRenditionDimensions(
               _qualityRenditionAt(au.ptsMs),
             );
@@ -240,14 +421,77 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
           },
         );
     _hasDecodePump = true;
-    clock.onFrameDue = _decodePump.requestThrough;
+    clock.onFrameDue = _requestVideoThrough;
+    clock.onPlaybackStateChanged = _syncHardwareClock;
+  }
+
+  void _requestVideoThrough(int nowMs) {
+    final lead = _hardwareVideoActive && clock.isPlaying
+        ? _hardwareDecodeLeadMs
+        : 0;
+    _decodePump.requestThrough(nowMs + lead);
+    _sampleAbrBufferHealth();
+  }
+
+  void _syncHardwareClock(int nowMs, bool playing) {
+    final hardware = hardwareDecoder;
+    if (!_hardwareVideoActive || hardware == null) return;
+    unawaited(
+      hardware
+          .updateClock(mediaTimeUs: nowMs * 1000, playing: playing)
+          .catchError((Object error, StackTrace stackTrace) {
+            _handleHardwareDecoderError(error);
+          }),
+    );
+  }
+
+  Future<_VideoDecodeResult> _decodeVideoAccessUnit(
+    TimestampedAccessUnit accessUnit,
+  ) async {
+    if (_hardwareFallbackPending) {
+      throw _HardwareFallbackPending(
+        _hardwareFallbackCause ?? 'MediaCodec failed',
+      );
+    }
+    final hardware = hardwareDecoder;
+    if (_hardwareVideoActive && hardware != null) {
+      try {
+        final receipt = await hardware.queueAccessUnit(
+          nals: accessUnit.nals,
+          presentationTimeUs: accessUnit.ptsMs * 1000,
+          clockMediaTimeUs: clock.nowMs * 1000,
+          playing: clock.isPlaying,
+        );
+        _hardwareDecoderName = receipt.decoderName;
+        _hardwareQueuedFrames[accessUnit.ptsMs] = accessUnit;
+        return _HardwareVideoDecodeResult(receipt);
+      } catch (error) {
+        // A first-IDR configure failure can safely retry through the Dart
+        // decoder. A later dependent picture cannot switch decoder state
+        // mid-GOP, so it is reported and recovered by the normal IDR rebuild.
+        if (accessUnit.hasIdr) {
+          _hardwareVideoSupported = false;
+          _hardwareVideoActive = false;
+          decoder.reset();
+          if (mounted) append('MediaCodec unavailable; using Dart: $error');
+        } else {
+          _handleHardwareDecoderError(error);
+          throw _HardwareFallbackPending(error);
+        }
+      }
+    }
+    return _SoftwareVideoDecodeResult(
+      await decoder.decodeAccessUnitOrThrow(accessUnit.nals),
+    );
   }
 
   void _handleDecodeQueueState(SequentialDecodeQueueState state) {
     if (!mounted || !_rollingHls || _rollingFailed) return;
     switch (state) {
       case SequentialDecodeQueueState.starved:
-        _observeAutoQuality(starved: true, latenessMs: 0);
+        _telemetry.recordVideoStarvation(clock.nowMs);
+        _publishTelemetry();
+        _sampleAbrBufferHealth(starved: true, force: true);
         if (!_rollingAudioClockLocked && clock.isPlaying) {
           _resumeVideoOnlyAfterStarvation = true;
           clock.pause();
@@ -255,6 +499,8 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         setState(() => decodeInfo = 'Buffering video…');
         break;
       case SequentialDecodeQueueState.ready:
+        _telemetry.recordBufferRecovered(clock.nowMs);
+        _publishTelemetry();
         if (_resumeVideoOnlyAfterStarvation && !_rollingAudioClockLocked) {
           _resumeVideoOnlyAfterStarvation = false;
           clock.play(fromMs: clock.nowMs);
@@ -342,6 +588,7 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
       _decodePump.appendItems(accessUnits.sublist(offset, offset + count));
       _rollingVideoAccessUnits += count;
       offset += count;
+      _publishTelemetry();
     }
     _rollingLastIdrAccessUnitIndex = validatedLastIdr;
   }
@@ -367,8 +614,13 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
 
   void _presentDecodedFrame(
     TimestampedAccessUnit au,
-    H264WorkerDecodeResult decoded,
+    _VideoDecodeResult result,
   ) {
+    if (result case _HardwareVideoDecodeResult(:final receipt)) {
+      _hardwareDecoderName = receipt.decoderName;
+      return;
+    }
+    final decoded = (result as _SoftwareVideoDecodeResult).decoded;
     final frame = decoded.frame;
     final stats = decoded.stats;
     if (!mounted) return;
@@ -396,12 +648,15 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
       outputHeight: renderSize.height,
       onFrame: (rgba) {
         if (!mounted) return;
+        _telemetry.recordPresentationUpdate();
+        _telemetry.recordBufferRecovered(au.ptsMs);
+        _publishTelemetry();
         current = au;
         final coalesced = frameRenderer.coalescedFrameCount;
         decodeInfo =
             '$frameDecodeInfo'
             '${coalesced == 0 ? "" : " • render-coalesced $coalesced"}';
-        _presentedVideo.value = _PresentedVideoFrame(
+        _presentedVideo.value = _PresentedVideoFrame.software(
           accessUnit: au,
           rgba: rgba,
           width: renderSize.width,
@@ -416,6 +671,118 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         }
       },
     );
+  }
+
+  void _handleHardwareFrameRendered(AndroidH264RenderedFrame frame) {
+    if (!mounted || !_hardwareVideoActive) return;
+    final ptsMs =
+        frame.presentationTimeUs ~/ Duration.microsecondsPerMillisecond;
+    final accessUnit = _hardwareQueuedFrames[ptsMs];
+    if (accessUnit == null) return;
+    final stale = <int>[
+      for (final queuedPts in _hardwareQueuedFrames.keys)
+        if (queuedPts <= ptsMs) queuedPts,
+    ];
+    for (final queuedPts in stale) {
+      _hardwareQueuedFrames.remove(queuedPts);
+    }
+
+    final textureId = hardwareDecoder?.textureId;
+    if (textureId == null) return;
+    final rendition = _qualityRenditionAt(ptsMs);
+    if (rendition != null &&
+        !identical(_displayedQualityRendition, rendition)) {
+      _displayedQualityRendition = rendition;
+      _refreshQualityInfo();
+      append('Quality now visible: ${rendition.label}');
+    }
+    _observeAutoQuality(
+      starved: false,
+      latenessMs: math.max(0, clock.nowMs - ptsMs),
+    );
+    current = accessUnit;
+    _telemetry.recordPresentationUpdate();
+    _telemetry.recordBufferRecovered(ptsMs);
+    _publishTelemetry();
+    decodeInfo =
+        'Hardware H.264 ($_hardwareDecoderName): '
+        '${frame.width}x${frame.height}';
+    _presentedVideo.value = _PresentedVideoFrame.hardware(
+      accessUnit: accessUnit,
+      textureId: textureId,
+      width: frame.width,
+      height: frame.height,
+      decodeInfo: decodeInfo,
+    );
+  }
+
+  void _handleHardwareDecoderError(Object error) {
+    if (!mounted || !_hardwareVideoActive) return;
+    final resumeAfterRecovery =
+        clock.isPlaying || (_audioController?.isPlaying ?? false);
+    _hardwareVideoSupported = false;
+    _hardwareVideoActive = false;
+    _hardwareFallbackPending = true;
+    _hardwareFallbackCause = error;
+    setState(() {
+      decodeInfo = 'Hardware decoder failed; switching to Dart…';
+    });
+    unawaited(
+      _serializeTransport(
+        () => _recoverWithSoftwareDecoder(
+          error,
+          resumeAfterRecovery: resumeAfterRecovery,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _recoverWithSoftwareDecoder(
+    Object error, {
+    required bool resumeAfterRecovery,
+  }) async {
+    final targetMs = clock.nowMs;
+    clock.pause();
+    final audio = _audioController;
+    if (audio != null && audio.isPlaying) await audio.pause();
+
+    final targetIndex = _latestAccessUnitAtOrBefore(targetMs);
+    _hardwareFallbackPending = false;
+    _hardwareFallbackCause = null;
+    if (targetIndex == null ||
+        !await _seekToAccessUnit(
+          targetIndex,
+          resumeAfterSeekOverride: resumeAfterRecovery,
+        )) {
+      if (mounted) {
+        setState(() {
+          decodeInfo = 'Hardware decoder failed: $error. Rebuild to retry.';
+        });
+      }
+      return;
+    }
+    if (mounted) {
+      _telemetry.recordDecoderRecovery();
+      _publishTelemetry();
+      append('MediaCodec failed; resumed with the Pure Dart decoder: $error');
+    }
+  }
+
+  int? _latestAccessUnitAtOrBefore(int targetMs) {
+    int? selectedIndex;
+    int? selectedPts;
+    for (
+      var index = _decodePump.firstRetainedIndex;
+      index < _decodePump.endIndex;
+      index++
+    ) {
+      final pts = _decodePump.itemAt(index).ptsMs;
+      if (pts <= targetMs && (selectedPts == null || pts >= selectedPts)) {
+        selectedIndex = index;
+        selectedPts = pts;
+      }
+    }
+    return selectedIndex ?? _firstRetainedIdrIndex();
   }
 
   ({int width, int height}) _qualityRenderSize(
@@ -501,6 +868,15 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
 
   void _resetDecodeAndRender() {
     decoder.reset();
+    _hardwareQueuedFrames.clear();
+    final hardware = hardwareDecoder;
+    if (hardware != null) {
+      unawaited(
+        hardware.reset().catchError((Object error, StackTrace stackTrace) {
+          if (mounted) append('Hardware decoder reset failed: $error');
+        }),
+      );
+    }
     frameRenderer.reset();
   }
 
@@ -514,8 +890,74 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
     if (change != null) _handleQualityDecision(change);
   }
 
+  void _sampleAbrBufferHealth({bool starved = false, bool force = false}) {
+    final controller = _qualityController;
+    if (controller == null) return;
+    final sampleMs = _abrHealthClock.elapsedMilliseconds;
+    if (!force && sampleMs - _lastAbrHealthSampleMs < 500) return;
+    _lastAbrHealthSampleMs = sampleMs;
+
+    final videoBufferedMs = _videoBufferedAheadMs();
+    final audio = _audioController;
+    final source = audio?.source;
+    int? audioBufferedMs;
+    if (audio != null && source != null && audio.hasAudio) {
+      final endUs = audio.seekableEndMediaTimeUs ?? source.endPtsUs;
+      final currentUs =
+          audio.currentMediaTimeMs * Duration.microsecondsPerMillisecond;
+      audioBufferedMs = math.max(
+        0,
+        (endUs - currentUs) ~/ Duration.microsecondsPerMillisecond,
+      );
+    }
+    final change = controller.observeBuffer(
+      videoBufferedMs: videoBufferedMs,
+      audioBufferedMs: audioBufferedMs,
+      playing: clock.isPlaying || (audio?.isPlaying ?? false),
+      starved: starved,
+    );
+    if (change != null) _handleQualityDecision(change);
+  }
+
+  int _videoBufferedAheadMs() {
+    final nowMs = clock.nowMs;
+    var furthestPtsMs = nowMs;
+    for (
+      var index = math.max(
+        _decodePump.nextIndex,
+        _decodePump.firstRetainedIndex,
+      );
+      index < _decodePump.endIndex;
+      index++
+    ) {
+      furthestPtsMs = math.max(furthestPtsMs, _decodePump.itemAt(index).ptsMs);
+    }
+    if (_hardwareQueuedFrames.isNotEmpty) {
+      furthestPtsMs = math.max(furthestPtsMs, _hardwareQueuedFrames.lastKey()!);
+    }
+    return math.max(0, furthestPtsMs - nowMs);
+  }
+
+  int get _maximumAutomaticQualityPixels {
+    final capabilities = _hardwareVideoCapabilities;
+    if (!_hardwareVideoActive || capabilities == null) return 848 * 480;
+    final designLimit = capabilities.hardwareAccelerated
+        ? 1920 * 1080
+        : 1280 * 720;
+    final codecLimit = capabilities.maximumPixels;
+    return codecLimit <= 0 ? designLimit : math.min(codecLimit, designLimit);
+  }
+
+  int? get _maximumAutomaticQualityBandwidth {
+    final capabilities = _hardwareVideoCapabilities;
+    if (!_hardwareVideoActive || capabilities == null) return null;
+    return capabilities.maximumBitrate > 0 ? capabilities.maximumBitrate : null;
+  }
+
   void _handleQualityDecision(HlsQualityChange change) {
     if (!mounted) return;
+    _telemetry.recordQualitySwitch();
+    _publishTelemetry();
     _refreshQualityInfo();
     append(
       'Quality target ${change.previous.label} -> ${change.current.label}: '
@@ -551,9 +993,16 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
           ? 'Auto'
           : 'Manual';
       final target = controller.selected;
+      final estimate = controller.estimatedBitsPerSecond;
+      final health = controller.bufferAheadMs;
+      final telemetry =
+          '${estimate == null ? "" : " · net ${(estimate / 1000000).toStringAsFixed(1)} Mbps"}'
+          '${health == null ? "" : " · buffer ${(health / 1000).toStringAsFixed(1)}s"}';
       _qualityInfo = visible == null || identical(visible, target)
           ? 'Quality: $mode · ${target.label}'
-          : 'Quality: $mode · ${visible.label} → pending ${target.label}';
+                '$telemetry'
+          : 'Quality: $mode · ${visible.label} → pending ${target.label}'
+                '$telemetry';
     });
   }
 
@@ -614,6 +1063,13 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
     Object error,
     StackTrace stackTrace,
   ) {
+    if (error is _HardwareFallbackPending) {
+      debugPrint(
+        'MediaCodec failed at ${au.ptsMs}ms; Dart fallback scheduled: '
+        '${error.cause}\n$stackTrace',
+      );
+      return;
+    }
     if (_rollingHls) {
       _failRollingPlayback(
         'Decoder stopped at ${au.ptsMs}ms: $error',
@@ -649,14 +1105,21 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _queueBuildEpoch++;
     unawaited(_cancelActiveHlsBuild());
     urlCtrl.dispose();
     _presentedVideo.dispose();
+    _telemetryInfo.dispose();
+    unawaited(_hardwareFrames?.cancel());
+    unawaited(_hardwareErrors?.cancel());
+    unawaited(_hardwareSurfaceAvailability?.cancel());
     clock.dispose();
     _decodePump.dispose();
     frameRenderer.dispose();
     decoder.dispose();
+    final hardware = hardwareDecoder;
+    if (hardware != null) unawaited(hardware.dispose());
     unawaited(_disposeAudio());
     super.dispose();
   }
@@ -672,6 +1135,12 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
     final epoch = ++_queueBuildEpoch;
     await _cancelActiveHlsBuild();
     _ensureBuildCurrent(epoch);
+    _hardwareVideoActive = _hardwareVideoSupported;
+    _hardwareFallbackPending = false;
+    _hardwareFallbackCause = null;
+    _hardwareSurfaceRecoveryRequired = false;
+    _telemetry.reset();
+    _publishTelemetry();
     setState(() {
       loading = true;
       log = '';
@@ -980,6 +1449,9 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
           });
         }
       case AudioPlaybackEventType.underrun:
+        _telemetry.recordAudioUnderrun(event.mediaTimeUs ~/ 1000);
+        _publishTelemetry();
+        _sampleAbrBufferHealth(starved: true, force: true);
         setState(() {
           audioInfo = 'Audio underrun: ${event.message ?? "buffer starved"}';
           if (_rollingAudioClockLocked) decodeInfo = 'Buffering audio…';
@@ -1323,13 +1795,27 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         append('Master playlist. Variants=${variants.length}');
         if (variants.isEmpty) throw Exception('No variants found.');
 
-        final baselineVariants = variants
+        final probeableVariants = <HlsVariant>[];
+        final advertisedRejectedReasons = <String>{};
+        for (final variant in variants) {
+          final codecReason = hlsVariantUnsupportedVideoCodecReason(variant);
+          if (codecReason == null) {
+            probeableVariants.add(variant);
+          } else {
+            advertisedRejectedReasons.add(codecReason);
+            append(
+              'Skip variant ${variant.resolution ?? variant.uri}: '
+              '$codecReason',
+            );
+          }
+        }
+        final baselineVariants = probeableVariants
             .where(
               (variant) =>
                   (variant.codecs ?? '').toLowerCase().contains('avc1.42'),
             )
             .toList();
-        final otherVariants = variants
+        final otherVariants = probeableVariants
             .where(
               (variant) =>
                   !(variant.codecs ?? '').toLowerCase().contains('avc1.42'),
@@ -1338,7 +1824,7 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         final candidates = <HlsVariant>[...baselineVariants, ...otherVariants];
 
         final compatibleVariants = <HlsVariant>[];
-        final rejectedReasons = <String>{};
+        final rejectedReasons = <String>{...advertisedRejectedReasons};
         final probeResults = await Future.wait<_VariantProbeResult>([
           for (final variant in candidates)
             _probeVariantCompatibility(
@@ -1465,6 +1951,8 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
               initialManualVariantUri: _qualitySelectionId == _autoQualityId
                   ? null
                   : selectedVariant.uri,
+              maximumAutomaticPixels: _maximumAutomaticQualityPixels,
+              maximumAutomaticBandwidth: _maximumAutomaticQualityBandwidth,
             );
           } catch (error) {
             append(
@@ -1503,6 +1991,10 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
                 _handleActiveQuality(rendition);
               }
             },
+          );
+          append(
+            'Auto quality ceiling: ${controller.automaticCeiling.label} '
+            'for the active decode device',
           );
           _refreshQualityInfo();
         } else {
@@ -1749,6 +2241,7 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
               : adaptiveVideoFetcher?.renditionForSequence(mediaSequence),
         );
         await _appendRollingVideoBatch(update.videoAccessUnits, epoch);
+        _sampleAbrBufferHealth(force: true);
 
         final progress = update.progress;
         if (progress.videoSegmentsLoaded == 1 ||
@@ -2129,8 +2622,10 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
       );
       append("samples=${track.sampleSizes.length}");
 
+      SpsInfo? mp4Sps;
       if (track.avc.sps.isNotEmpty) {
         final sps = parseSpsNal(track.avc.sps.first);
+        mp4Sps = sps;
         append(
           "MP4 SPS: ${sps.width}x${sps.height} profile=${sps.profileIdc} level=${sps.levelIdc}",
         );
@@ -2144,8 +2639,25 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
           "MP4 PPS: entropyCodingModeFlag=${pps.entropyCodingModeFlag} t8x8=${pps.transform8x8ModeFlag}",
         );
         if (pps.entropyCodingModeFlag) {
-          append("MP4 not supported: CABAC stream (need CAVLC/Baseline)");
-          return;
+          if (!_hardwareVideoActive) {
+            append(
+              'MP4 not supported by the active Pure Dart path: '
+              'CABAC requires Android MediaCodec',
+            );
+            return;
+          }
+          final capabilities = _hardwareVideoCapabilities;
+          if (capabilities != null &&
+              mp4Sps != null &&
+              (mp4Sps.width > capabilities.maximumWidth ||
+                  mp4Sps.height > capabilities.maximumHeight)) {
+            append(
+              'MP4 exceeds MediaCodec geometry: '
+              '${mp4Sps.width}x${mp4Sps.height}',
+            );
+            return;
+          }
+          append('MP4 CABAC accepted by Android MediaCodec');
         }
       } else {
         append("MP4 WARN: no PPS in avcC");
@@ -2582,7 +3094,7 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         _rollingHls && (_decodePump.firstRetainedIndex > 0 || audioWindowMoved);
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Pure Dart Playback')),
+      appBar: AppBar(title: const Text('NDVY Playback')),
       body: Padding(
         padding: const EdgeInsets.all(12),
         child: SingleChildScrollView(
@@ -2719,6 +3231,17 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
                       style: const TextStyle(fontFamily: 'monospace'),
                     ),
                   ),
+                  Padding(
+                    padding: const EdgeInsets.only(left: 8),
+                    child: ValueListenableBuilder<String>(
+                      valueListenable: _telemetryInfo,
+                      builder: (context, value, _) => Text(
+                        value,
+                        key: const Key('playback-health'),
+                        style: const TextStyle(fontFamily: 'monospace'),
+                      ),
+                    ),
+                  ),
                 ],
               ),
               const SizedBox(height: 10),
@@ -2744,8 +3267,19 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
                                     style: const TextStyle(color: Colors.white),
                                   ),
                                 )
+                              : presented.textureId != null
+                              ? FittedBox(
+                                  fit: BoxFit.contain,
+                                  child: SizedBox(
+                                    width: presented.width.toDouble(),
+                                    height: presented.height.toDouble(),
+                                    child: Texture(
+                                      textureId: presented.textureId!,
+                                    ),
+                                  ),
+                                )
                               : PureFrameView(
-                                  rgba: presented.rgba,
+                                  rgba: presented.rgba!,
                                   width: presented.width,
                                   height: presented.height,
                                 ),

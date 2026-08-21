@@ -75,6 +75,55 @@ segment-42.ts
     expect(playlist.segments, hasLength(2));
   });
 
+  test('rejects encrypted, fMP4, byte-range, and gap media early', () async {
+    final tags = <String, String>{
+      '#EXT-X-KEY:METHOD=AES-128,URI="key.bin"': 'encrypted media',
+      '#EXT-X-MAP:URI="init.mp4"': 'fragmented MP4',
+      '#EXT-X-BYTERANGE:100@0': 'byte-range',
+      '#EXT-X-GAP': 'gap segments',
+      '#EXT-X-I-FRAMES-ONLY': 'I-frame-only',
+    };
+
+    for (final entry in tags.entries) {
+      await expectLater(
+        fetchMediaPlaylist(
+          uri,
+          byteFetcher: (_) => fetch('''
+#EXTM3U
+${entry.key}
+#EXTINF:6,
+segment.ts
+#EXT-X-ENDLIST
+'''),
+        ),
+        throwsA(
+          isA<HlsMediaFeatureUnsupportedException>()
+              .having((error) => error.playlistUri, 'playlistUri', uri)
+              .having(
+                (error) => error.feature,
+                'feature',
+                contains(entry.value),
+              ),
+        ),
+      );
+    }
+  });
+
+  test('allows METHOD=NONE because following TS segments are clear', () async {
+    final playlist = await fetchMediaPlaylist(
+      uri,
+      byteFetcher: (_) => fetch('''
+#EXTM3U
+#EXT-X-KEY:METHOD=NONE
+#EXTINF:6,
+segment.ts
+#EXT-X-ENDLIST
+'''),
+    );
+
+    expect(playlist.segments.single.uri.path, endsWith('segment.ts'));
+  });
+
   test('accepts one non-zero discontinuity epoch', () async {
     final playlist = await fetchMediaPlaylist(
       uri,

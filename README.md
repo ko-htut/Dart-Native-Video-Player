@@ -1,10 +1,12 @@
-# NDVY Player — Dart-native H.264 + AAC Playback
+# NDVY Player — Dart-first H.264 + AAC Playback
 
-NDVY Player is an experimental Flutter media player that demuxes and decodes
-H.264 video and AAC-LC audio without `video_player`, FFmpeg, MediaCodec,
-AVPlayer, or another platform video codec. Compressed media stays in Dart.
-Decoded PCM crosses a small `dart:ffi` boundary to AAudio or AudioQueue, and
-Flutter displays the decoded video frames.
+NDVY Player is an experimental Dart-first Flutter media player. HLS/MP4
+parsing, MPEG-TS demultiplexing, access-unit assembly, quality policy, timing,
+and playback state are implemented in Dart without `video_player` or FFmpeg.
+On Android, H.264 normally uses an asynchronous MediaCodec-to-Flutter-texture
+backend. A custom Pure Dart H.264 decoder remains the correctness reference
+and automatic fallback. AAC-LC is decoded in Dart; decoded PCM crosses a small
+`dart:ffi` boundary to AAudio or AudioQueue.
 
 **Current status:** the documented implementation is complete as of
 2026-08-21. Its validation evidence and known performance boundary are
@@ -15,13 +17,16 @@ described in
 
 <p align="center">
   <img src="docs/images/video-quality.png"
-       alt="NDVY Player playing the Mux HLS stream at 848x480"
+       alt="NDVY Player Pure Dart fallback playing Mux HLS at 848x480"
        width="390">
 </p>
 
-The screenshot is an actual Android emulator profile run of the public Mux
-master playlist at **848x480 / 836 kbps**. The on-frame diagnostics show the
-decoded resolution, disposable B-frame drops, and coalesced render work.
+The screenshot records the Pure Dart fallback path playing the public Mux
+master playlist at **848x480 / 836 kbps**. Its on-frame diagnostics show the
+decoded resolution, disposable B-frame drops, and coalesced render work. The
+current Android path was also smoke-tested on an emulator through
+`c2.goldfish.h264.decoder`; frames were rendered directly to a Flutter texture
+with no rebuffer or codec error during the verification run.
 
 The tested master is:
 
@@ -55,7 +60,12 @@ proves decode correctness, not real-time speed on every phone.
   weighted prediction, short-term DPB/list reordering, POC, MMCO 1, and
   in-loop deblocking.
 - Pure-Dart AAC-LC decode with an audio-master playback clock.
-- A persistent H.264 worker isolate and background YUV-to-RGBA conversion.
+- An asynchronous Android MediaCodec H.264 backend that renders to a Flutter
+  texture, probes codec limits, applies bounded input backpressure, and
+  recovers a recreated surface from a dependency-safe keyframe.
+- Automatic fallback to a persistent Pure Dart H.264 worker isolate when the
+  Android hardware backend is unavailable or fails.
+- Background YUV-to-RGBA conversion for the Pure Dart video path.
 - One in-flight image upload with latest-frame coalescing and viewport-sized
   output to reduce UI-isolate work and allocation pressure.
 - Conservative dropping of sufficiently late disposable non-reference B
@@ -66,6 +76,11 @@ proves decode correctness, not real-time speed on every phone.
   segment/IDR boundary instead of stopping and rebuilding current playback.
 - Compatibility probing that rejects unsupported parameter-set or slice
   syntax before a rendition is admitted.
+- Early rejection of explicitly advertised HEVC, AV1, VP9, and Dolby Vision,
+  plus encrypted, fMP4-map, byte-range, gap, and I-frame-only HLS input that
+  the current MPEG-TS pipeline cannot represent safely.
+- App lifecycle recovery, bounded retries, rebuffer/switch/drop telemetry, and
+  a long-running rolling-pump soak regression.
 - Bounded segment queues, compressed-video retention, decoded PCM storage, and
   presentation reordering.
 
@@ -77,18 +92,21 @@ Unsupported or malformed syntax fails closed rather than being guessed.
 the next safe boundary. The UI can briefly show `active → pending` while the
 already-buffered segment finishes; audio and playback state continue.
 
-**Auto** uses measured network throughput and decoder/render lateness. It can
-step up when healthy and repeatedly step down while the device remains behind.
-On the tested Pixel-class phone, Auto normally settles below 720p for this
-60-fps source.
+**Auto** uses measured network throughput, buffer health, decoder/render
+lateness, and the active Android codec's advertised limits. It can step up
+when healthy and repeatedly step down while the network or device remains
+behind.
 
-720p and 1080p are decode-correct but remain best-effort in the current
-pure-Dart software path. They can stutter on phones. A physical-device 720p
-measurement decoded the retained reference cadence at 22.21 fps and took
+Android MediaCodec is the preferred phone path for 720p and 1080p. Actual
+smoothness still depends on the device codec, source frame rate, network, and
+render budget; the quality selector may step down when health deteriorates.
+
+The Pure Dart fallback is decode-correct through the verified 1080p streams,
+but high-resolution software playback remains best-effort. A physical-device
+720p measurement decoded the retained reference cadence at 22.21 fps and took
 14.319 seconds for 10 seconds of source after conservative disposable-B
-skipping; real-time playback required roughly 31.8 retained pictures/s.
-The current software path therefore does not claim smooth mobile 720p60 or
-1080p60.
+skipping; real-time playback required roughly 31.8 retained pictures/s. The
+Pure Dart path therefore does not claim smooth mobile 720p60 or 1080p60.
 
 ## Run
 
@@ -121,15 +139,18 @@ HLS/MP4 input
           timestamped access units
              /             \
             v               v
-   H.264 worker isolate   AAC-LC worker
-      YUV 4:2:0 frames    file-backed PCM
-            |               |
-    render worker +       AAudio / AudioQueue
-    latest-frame slot       master clock
-            \               /
-             +-- PTS scheduler --+
-                       |
-                  Flutter view
+          video backend             AAC-LC worker
+          /           \             file-backed PCM
+         v             v                   |
+ Android MediaCodec  Pure Dart worker   AAudio / AudioQueue
+   Surface texture   YUV 4:2:0 frames      master clock
+         |           render worker           |
+         |          latest-frame slot        |
+         +--------------+--------------------+
+                        |
+                  PTS scheduler
+                        |
+                  Flutter Texture/Image
 ```
 
 Important implementation locations:
@@ -142,6 +163,11 @@ Important implementation locations:
 - `lib/src/ts_h264_demux.dart` — stateful H.264 transport demux.
 - `lib/src/decoder/h264_baseline_idr_decoder.dart` — H.264 picture decode.
 - `lib/src/decoder/h264_decode_worker.dart` — persistent video worker isolate.
+- `lib/src/decoder/android_h264_texture_decoder.dart` — Dart-facing Android
+  hardware-video backend and texture lifecycle.
+- `android/app/src/main/kotlin/com/example/ndvy_player/MainActivity.kt` —
+  asynchronous MediaCodec/Surface implementation.
+- `lib/src/playback_reliability.dart` — bounded playback-health telemetry.
 - `lib/src/audio/` — AAC-LC decode, file-backed PCM, clock, and native sinks.
 - `lib/src/render/` and `lib/pure_frame_view.dart` — background conversion,
   upload coalescing, and frame display.
@@ -157,7 +183,7 @@ fvm flutter analyze
 fvm flutter test
 ```
 
-Result: **618 tests passed and 2 intentional opt-in platform tests skipped**.
+Result: **633 tests passed and 2 intentional opt-in network tests skipped**.
 
 The full network rendition regression is opt-in because it downloads and
 decodes large public test segments:
@@ -172,28 +198,39 @@ That command passed all five Mux renditions at the current snapshot. Focused
 tests additionally cover malformed input, CABAC/CAVLC syntax, POC/DPB/MMCO,
 weighted prediction, Direct motion, transforms, deblocking, TS continuity,
 quality selection, queue boundaries, audio timing, worker lifecycle, frame
-coalescing, and rollback after failed candidate pictures.
+coalescing, MediaCodec channel/lifecycle behavior, long-running queue
+retention, compatibility gates, and rollback after failed candidate pictures.
+An Android emulator smoke test additionally rendered the Mux stream through
+`c2.goldfish.h264.decoder` with zero reported rebuffers and codec errors.
 
 ## Known limitations
 
 - This remains a bounded experimental codec implementation, not a general
   replacement for all H.264, AAC, MP4, or HLS content.
-- Smooth 720p60/1080p60 mobile playback is outside the current
-  performance envelope. Auto quality is the recommended phone mode.
+- Android hardware decoding depends on MediaCodec availability and advertised
+  geometry/rate limits. Auto quality is the recommended phone mode.
+- Smooth software-only 720p60/1080p60 playback remains outside the measured
+  Pure Dart performance envelope.
 - HLS currently targets MPEG-TS H.264 plus ADTS AAC. fMP4/CMAF, encryption,
   DRM, and general `EXT-X-MEDIA` alternate-audio handling are unsupported.
+- HEVC/H.265, AV1, VP9, and Dolby Vision are not decoded; explicit codec
+  advertisements for them are rejected before rendition probing.
 - Only progressive 8-bit 4:2:0 H.264 within the validated tool envelope is
   accepted. Interlaced, high-bit-depth, and other chroma formats are rejected.
 - RGBA rendering currently uses limited-range BT.601; VUI color metadata is
   not yet propagated to the renderer.
 - Rolling seek is limited to the common retained audio/video window.
-- Audio output is implemented for Android API 26+, iOS, and macOS.
+- Android hardware video is the only native video backend. Other platforms use
+  the Pure Dart H.264 path. Audio output is implemented for Android API 26+,
+  iOS, and macOS.
 
 ## Current scope boundary
 
-The current scope ends with correct multi-rendition software decode, seamless
-manual and basic automatic quality switching, bounded playback state, and
-UI/render coalescing. Future work may add a native hardware-video backend for
-smooth 720p60/1080p60 on phones while keeping the pure-Dart path as the
-reference and fallback implementation. That work is not part of the current
-completion claim.
+The current scope ends with a Dart-first player engine, Android MediaCodec
+texture playback, automatic Pure Dart fallback, verified multi-rendition
+software decode, seamless manual/basic automatic quality switching, lifecycle
+recovery, bounded playback state, compatibility gates, and UI/render
+coalescing. It does not claim universal codec/HLS support or guaranteed
+720p60/1080p60 performance on every Android device. Apple hardware-video
+acceleration, richer media-session integration, and broader formats remain
+future work.

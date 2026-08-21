@@ -11,7 +11,12 @@ void main() {
 
     expect(controller.mode, HlsQualityMode.automatic);
     expect(controller.selected.bandwidth, 250000);
-    for (var i = 0; i < 2; i++) {
+    controller.observeBuffer(
+      videoBufferedMs: 12000,
+      audioBufferedMs: 11000,
+      playing: true,
+    );
+    for (var i = 0; i < 3; i++) {
       expect(
         controller.recordDownload(
           byteCount: 200000,
@@ -26,7 +31,7 @@ void main() {
     );
     expect(firstUpgrade?.current.bandwidth, 500000);
 
-    for (var i = 0; i < 3; i++) {
+    for (var i = 0; i < 4; i++) {
       controller.recordDownload(
         byteCount: 200000,
         elapsed: const Duration(milliseconds: 100),
@@ -56,11 +61,113 @@ void main() {
     expect(controller.selected, same(high));
     expect(controller.recordNetworkFailure(), isNull);
     expect(controller.observePlayback(latenessMs: 500, starved: true), isNull);
+    expect(
+      controller.observeBuffer(
+        videoBufferedMs: 0,
+        audioBufferedMs: 0,
+        playing: true,
+        starved: true,
+      ),
+      isNull,
+    );
     expect(controller.selected, same(high));
 
     final auto = controller.selectAutomatic();
     expect(auto?.current.bandwidth, 250000);
     expect(controller.mode, HlsQualityMode.automatic);
+  });
+
+  test('buffer starvation drops two levels and blocks rebound oscillation', () {
+    final controller = _controller();
+    controller.observeBuffer(videoBufferedMs: 12000, playing: true);
+    for (var i = 0; i < 8; i++) {
+      controller.recordDownload(
+        byteCount: 200000,
+        elapsed: const Duration(milliseconds: 100),
+        segmentDuration: const Duration(seconds: 4),
+      );
+    }
+    expect(controller.selected.bandwidth, 1500000);
+
+    final emergency = controller.observeBuffer(
+      videoBufferedMs: 0,
+      audioBufferedMs: 0,
+      playing: true,
+      starved: true,
+    );
+    expect(emergency?.current.bandwidth, 250000);
+    expect(controller.playbackConstrained, isTrue);
+
+    for (var i = 0; i < 8; i++) {
+      expect(
+        controller.recordDownload(
+          byteCount: 200000,
+          elapsed: const Duration(milliseconds: 100),
+          segmentDuration: const Duration(seconds: 4),
+        ),
+        isNull,
+      );
+    }
+    expect(controller.selected.bandwidth, 250000);
+
+    for (var i = 0; i < 8; i++) {
+      controller.observeBuffer(videoBufferedMs: 12000, playing: true);
+    }
+    expect(controller.playbackConstrained, isFalse);
+    for (var i = 0; i < 4; i++) {
+      controller.recordDownload(
+        byteCount: 200000,
+        elapsed: const Duration(milliseconds: 100),
+        segmentDuration: const Duration(seconds: 4),
+      );
+    }
+    expect(controller.selected.bandwidth, 500000);
+  });
+
+  test('automatic quality respects the decode-device pixel ceiling', () {
+    final controller = HlsQualityController(
+      renditions: <HlsQualityRendition>[
+        _rendition(1500000),
+        _rendition(250000),
+        _rendition(500000),
+      ],
+      maximumAutomaticPixels: 640 * 360,
+    );
+    expect(controller.automaticCeiling.bandwidth, 500000);
+    controller.observeBuffer(videoBufferedMs: 12000, playing: true);
+    for (var i = 0; i < 20; i++) {
+      controller.recordDownload(
+        byteCount: 200000,
+        elapsed: const Duration(milliseconds: 100),
+        segmentDuration: const Duration(seconds: 4),
+      );
+    }
+    expect(controller.selected.bandwidth, 500000);
+
+    controller.selectManual(controller.renditions.last.variant.uri);
+    expect(controller.selected.bandwidth, 1500000);
+  });
+
+  test('a segment slower than its media duration forces a downshift', () {
+    final controller = _controller();
+    controller.selectManual(controller.renditions[1].variant.uri);
+    controller.selectAutomatic();
+    controller.observeBuffer(videoBufferedMs: 12000, playing: true);
+    for (var i = 0; i < 4; i++) {
+      controller.recordDownload(
+        byteCount: 200000,
+        elapsed: const Duration(milliseconds: 100),
+        segmentDuration: const Duration(seconds: 4),
+      );
+    }
+    expect(controller.selected.bandwidth, 500000);
+
+    final down = controller.recordDownload(
+      byteCount: 200000,
+      elapsed: const Duration(seconds: 4),
+      segmentDuration: const Duration(seconds: 4),
+    );
+    expect(down?.current.bandwidth, 250000);
   });
 
   test(

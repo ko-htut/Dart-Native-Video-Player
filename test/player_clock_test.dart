@@ -11,6 +11,24 @@ class _Item {
 }
 
 void main() {
+  test('PlayerClock reports seek, play, and pause clock anchors', () {
+    final clock = PlayerClock();
+    final states = <({int nowMs, bool playing})>[];
+    clock.onPlaybackStateChanged = (nowMs, playing) {
+      states.add((nowMs: nowMs, playing: playing));
+    };
+
+    clock.setTime(120);
+    clock.play(fromMs: 120, timeSource: () => 145);
+    clock.pause();
+
+    expect(states.map((state) => state.playing), <bool>[false, true, false]);
+    expect(states[0].nowMs, 120);
+    expect(states[1].nowMs, 145);
+    expect(states[2].nowMs, 145);
+    clock.dispose();
+  });
+
   group('validateSequentialDecodeDependencyWindow', () {
     bool isBoundary(_Item item) => item.id.startsWith('K');
 
@@ -607,6 +625,55 @@ void main() {
       expect(() => build(maximum: 3, retained: 3), throwsArgumentError);
       expect(() => build(retained: -1), throwsArgumentError);
     });
+
+    test(
+      '10,000-item rolling soak remains inside its resident bound',
+      () async {
+        const maximum = 120;
+        const retained = 15;
+        const groupSize = 25;
+        const groupCount = 400;
+        var decoded = 0;
+        final pump = SequentialDecodePump<_Item, String>(
+          timestampOf: (item) => item.ptsMs,
+          decode: (item) {
+            decoded++;
+            return item.id;
+          },
+          onLatestDecoded: (_, _) {},
+          onDecodeError: (_, _, _) => fail('soak decode should not fail'),
+          maxResidentItems: maximum,
+          retainedConsumedItems: retained,
+          isDependencyBoundary: (item) => item.id.startsWith('K'),
+        );
+        addTearDown(pump.dispose);
+        pump.replaceQueue(const <_Item>[], isFinal: false);
+
+        for (var group = 0; group < groupCount; group++) {
+          final base = group * groupSize;
+          final items = <_Item>[
+            for (var offset = 0; offset < groupSize; offset++)
+              _Item(
+                offset == 0 ? 'K$base' : 'p${base + offset}',
+                (base + offset) * 33,
+              ),
+          ];
+          while (!pump.tryAppendItems(items)) {
+            pump.requestThrough((base - 1) * 33);
+            await pump.waitUntilIdle();
+          }
+          pump.requestThrough((base + groupSize - 1) * 33);
+          await pump.waitUntilIdle();
+          expect(pump.residentLength, lessThanOrEqualTo(maximum));
+        }
+
+        expect(decoded, groupSize * groupCount);
+        expect(pump.nextIndex, groupSize * groupCount);
+        expect(pump.endIndex, groupSize * groupCount);
+        expect(pump.residentLength, lessThanOrEqualTo(maximum));
+        expect(pump.firstRetainedIndex, greaterThan(9800));
+      },
+    );
   });
 
   test('PlayerClock makes play and seek positions due immediately', () {

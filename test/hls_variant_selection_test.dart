@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:ndvy_player/src/hls.dart';
 
@@ -48,6 +50,54 @@ void main() {
       same(highAacLc),
     );
   });
+
+  test(
+    'prefilters explicit non-AVC video codecs but probes missing metadata',
+    () {
+      final avc = variant(
+        path: 'avc.m3u8',
+        bandwidth: 100,
+        codecs: 'avc3.640028,mp4a.40.2',
+      );
+      final hevc = variant(
+        path: 'hevc.m3u8',
+        bandwidth: 100,
+        codecs: 'hvc1.2.4.L153.B0,mp4a.40.2',
+      );
+      final unknown = HlsVariant(
+        uri: Uri.parse('https://example.test/unknown.m3u8'),
+      );
+
+      expect(hlsVariantUnsupportedVideoCodecReason(avc), isNull);
+      expect(hlsVariantUnsupportedVideoCodecReason(unknown), isNull);
+      expect(hlsVariantUnsupportedVideoCodecReason(hevc), contains('hvc1'));
+    },
+  );
+
+  test(
+    'rejects encrypted master session keys before variant fetching',
+    () async {
+      final masterUri = Uri.parse('https://example.test/master.m3u8');
+      final bytes = Uint8List.fromList(
+        '#EXTM3U\n'
+                '#EXT-X-SESSION-KEY:METHOD=SAMPLE-AES,URI="key"\n'
+                '#EXT-X-STREAM-INF:BANDWIDTH=100,CODECS="avc1.640028"\n'
+                'video.m3u8\n'
+            .codeUnits,
+      );
+
+      await expectLater(
+        fetchHlsVariants(masterUri, byteFetcher: (_) async => bytes),
+        throwsA(
+          isA<HlsMediaFeatureUnsupportedException>().having(
+            (error) => error.feature,
+            'feature',
+            contains('SAMPLE-AES'),
+          ),
+        ),
+      );
+    },
+  );
 
   test('pairs synchronized component renditions by media sequence', () {
     HlsMediaPlaylist playlist(double middleDuration) => HlsMediaPlaylist(

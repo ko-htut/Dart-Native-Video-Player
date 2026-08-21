@@ -1,6 +1,7 @@
 import 'dart:async';
 
 typedef PlaybackTimeSource = int Function();
+typedef PlaybackStateChanged = void Function(int nowMs, bool playing);
 
 class PlayerClock {
   Timer? _timer;
@@ -14,6 +15,7 @@ class PlayerClock {
   bool get isPlaying => _playing;
 
   void Function(int nowMs)? onFrameDue;
+  PlaybackStateChanged? onPlaybackStateChanged;
 
   void setTime(int ms) {
     _nowMs = ms;
@@ -24,6 +26,7 @@ class PlayerClock {
         ..start();
     }
     onFrameDue?.call(_nowMs);
+    onPlaybackStateChanged?.call(_nowMs, _playing);
   }
 
   /// Starts ticking from [fromMs].
@@ -42,6 +45,7 @@ class PlayerClock {
       ..start();
 
     _nowMs = _readCurrentTime();
+    onPlaybackStateChanged?.call(_nowMs, true);
 
     // Make a frame at the requested position eligible immediately. Waiting
     // for the first timer tick otherwise makes seeks and replay inconsistent.
@@ -64,6 +68,7 @@ class PlayerClock {
     _elapsed.stop();
     _timer?.cancel();
     _timer = null;
+    onPlaybackStateChanged?.call(_nowMs, false);
   }
 
   int _readCurrentTime() {
@@ -76,6 +81,7 @@ class PlayerClock {
   void dispose() {
     pause();
     onFrameDue = null;
+    onPlaybackStateChanged = null;
   }
 }
 
