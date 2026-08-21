@@ -1795,13 +1795,27 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen>
         append('Master playlist. Variants=${variants.length}');
         if (variants.isEmpty) throw Exception('No variants found.');
 
-        final baselineVariants = variants
+        final probeableVariants = <HlsVariant>[];
+        final advertisedRejectedReasons = <String>{};
+        for (final variant in variants) {
+          final codecReason = hlsVariantUnsupportedVideoCodecReason(variant);
+          if (codecReason == null) {
+            probeableVariants.add(variant);
+          } else {
+            advertisedRejectedReasons.add(codecReason);
+            append(
+              'Skip variant ${variant.resolution ?? variant.uri}: '
+              '$codecReason',
+            );
+          }
+        }
+        final baselineVariants = probeableVariants
             .where(
               (variant) =>
                   (variant.codecs ?? '').toLowerCase().contains('avc1.42'),
             )
             .toList();
-        final otherVariants = variants
+        final otherVariants = probeableVariants
             .where(
               (variant) =>
                   !(variant.codecs ?? '').toLowerCase().contains('avc1.42'),
@@ -1810,7 +1824,7 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen>
         final candidates = <HlsVariant>[...baselineVariants, ...otherVariants];
 
         final compatibleVariants = <HlsVariant>[];
-        final rejectedReasons = <String>{};
+        final rejectedReasons = <String>{...advertisedRejectedReasons};
         final probeResults = await Future.wait<_VariantProbeResult>([
           for (final variant in candidates)
             _probeVariantCompatibility(
@@ -2608,8 +2622,10 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen>
       );
       append("samples=${track.sampleSizes.length}");
 
+      SpsInfo? mp4Sps;
       if (track.avc.sps.isNotEmpty) {
         final sps = parseSpsNal(track.avc.sps.first);
+        mp4Sps = sps;
         append(
           "MP4 SPS: ${sps.width}x${sps.height} profile=${sps.profileIdc} level=${sps.levelIdc}",
         );
@@ -2623,8 +2639,25 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen>
           "MP4 PPS: entropyCodingModeFlag=${pps.entropyCodingModeFlag} t8x8=${pps.transform8x8ModeFlag}",
         );
         if (pps.entropyCodingModeFlag) {
-          append("MP4 not supported: CABAC stream (need CAVLC/Baseline)");
-          return;
+          if (!_hardwareVideoActive) {
+            append(
+              'MP4 not supported by the active Pure Dart path: '
+              'CABAC requires Android MediaCodec',
+            );
+            return;
+          }
+          final capabilities = _hardwareVideoCapabilities;
+          if (capabilities != null &&
+              mp4Sps != null &&
+              (mp4Sps.width > capabilities.maximumWidth ||
+                  mp4Sps.height > capabilities.maximumHeight)) {
+            append(
+              'MP4 exceeds MediaCodec geometry: '
+              '${mp4Sps.width}x${mp4Sps.height}',
+            );
+            return;
+          }
+          append('MP4 CABAC accepted by Android MediaCodec');
         }
       } else {
         append("MP4 WARN: no PPS in avcC");
