@@ -4,10 +4,10 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
-import android.os.Build
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
@@ -194,6 +194,7 @@ private class H264TextureDecoder(
         }
 
         val surfaceProducer = producer ?: textures.createSurfaceProducer().also {
+            it.setCallback(surfaceCallback)
             producer = it
         }
         surfaceProducer.setSize(width, height)
@@ -301,10 +302,34 @@ private class H264TextureDecoder(
         codecHandler.post {
             releaseCodec()
             postResult {
+                producer?.setCallback(null)
                 producer?.release()
                 producer = null
                 result?.success(null)
                 codecThread.quitSafely()
+            }
+        }
+    }
+
+    private val surfaceCallback = object : TextureRegistry.SurfaceProducer.Callback {
+        override fun onSurfaceCleanup() {
+            if (disposed) return
+            codecHandler.postAtFrontOfQueue { releaseCodec() }
+            mainHandler.post {
+                channel.invokeMethod(
+                    "surfaceAvailabilityChanged",
+                    mapOf("available" to false),
+                )
+            }
+        }
+
+        override fun onSurfaceAvailable() {
+            if (disposed) return
+            mainHandler.post {
+                channel.invokeMethod(
+                    "surfaceAvailabilityChanged",
+                    mapOf("available" to true),
+                )
             }
         }
     }

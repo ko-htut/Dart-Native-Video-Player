@@ -107,6 +107,58 @@ void main() {
     expect(calls.where((call) => call.method == 'configure'), isEmpty);
     expect(calls.where((call) => call.method == 'queueAccessUnit'), isEmpty);
   });
+
+  test('surface loss invalidates configuration until an IDR replay', () async {
+    final decoder = AndroidH264TextureDecoder(channel: channel);
+    addTearDown(decoder.dispose);
+    final availability = <bool>[];
+    final subscription = decoder.surfaceAvailability.listen(availability.add);
+    addTearDown(subscription.cancel);
+
+    await decoder.queueAccessUnit(
+      nals: <Uint8List>[_sps, _pps, _idr],
+      presentationTimeUs: 0,
+      clockMediaTimeUs: 0,
+      playing: true,
+    );
+    expect(decoder.isConfigured, isTrue);
+
+    await _sendNativeMethod(
+      channel,
+      'surfaceAvailabilityChanged',
+      <String, Object?>{'available': false},
+    );
+    expect(availability, <bool>[false]);
+    expect(decoder.isConfigured, isFalse);
+
+    await _sendNativeMethod(
+      channel,
+      'surfaceAvailabilityChanged',
+      <String, Object?>{'available': true},
+    );
+    expect(availability, <bool>[false, true]);
+
+    await decoder.queueAccessUnit(
+      nals: <Uint8List>[_sps, _pps, _idr],
+      presentationTimeUs: 0,
+      clockMediaTimeUs: 0,
+      playing: false,
+    );
+    expect(calls.where((call) => call.method == 'configure'), hasLength(2));
+  });
+}
+
+Future<void> _sendNativeMethod(
+  MethodChannel channel,
+  String method,
+  Object? arguments,
+) async {
+  await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+      .handlePlatformMessage(
+        channel.name,
+        channel.codec.encodeMethodCall(MethodCall(method, arguments)),
+        (_) {},
+      );
 }
 
 final Uint8List _sps = _hex(

@@ -75,6 +75,8 @@ final class AndroidH264TextureDecoder {
   final StreamController<Object> _errors = StreamController<Object>.broadcast(
     sync: true,
   );
+  final StreamController<bool> _surfaceAvailability =
+      StreamController<bool>.broadcast(sync: true);
 
   Uint8List? _sequenceParameterSet;
   Uint8List? _pictureParameterSet;
@@ -89,6 +91,10 @@ final class AndroidH264TextureDecoder {
   Stream<AndroidH264RenderedFrame> get renderedFrames => _renderedFrames.stream;
 
   Stream<Object> get errors => _errors.stream;
+
+  /// Emits false before Android releases a background texture surface and
+  /// true after Flutter supplies its replacement on foreground resume.
+  Stream<bool> get surfaceAvailability => _surfaceAvailability.stream;
 
   int? get textureId => _textureId;
 
@@ -218,6 +224,7 @@ final class AndroidH264TextureDecoder {
       _channel.setMethodCallHandler(null);
       await _renderedFrames.close();
       await _errors.close();
+      await _surfaceAvailability.close();
     }
   }
 
@@ -248,6 +255,20 @@ final class AndroidH264TextureDecoder {
         if (!_disposed) {
           _errors.add(StateError(message ?? 'Android MediaCodec failed'));
         }
+        return null;
+      case 'surfaceAvailabilityChanged':
+        if (arguments is! Map<Object?, Object?>) return null;
+        final available = arguments['available'];
+        if (available is! bool || _disposed) return null;
+        if (!available) {
+          // The native codec is released before the old Surface becomes
+          // invalid. Force the next IDR replay to configure against the new
+          // Surface instead of assuming the previous codec still exists.
+          _textureId = null;
+          _configuredSequenceParameterSet = null;
+          _configuredPictureParameterSet = null;
+        }
+        _surfaceAvailability.add(available);
         return null;
     }
     return null;

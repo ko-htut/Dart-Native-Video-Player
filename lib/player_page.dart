@@ -22,6 +22,7 @@ import 'src/ts_pes.dart';
 import 'src/pes_pts.dart';
 import 'src/access_unit_pts.dart';
 import 'src/player_clock.dart';
+import 'src/playback_reliability.dart';
 import 'src/decoder/h264_decode_worker.dart';
 import 'src/decoder/android_h264_texture_decoder.dart';
 import 'src/decoder/pps.dart';
@@ -133,7 +134,8 @@ class PureDartPlaybackScreen extends StatefulWidget {
   State<PureDartPlaybackScreen> createState() => _PureDartPlaybackScreenState();
 }
 
-class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
+class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen>
+    with WidgetsBindingObserver {
   final urlCtrl = TextEditingController(
     // --- MP4 (use "Build Queue (MP4)" button) ---
     // text: 'assets/butterfly_dart.mp4',
@@ -172,11 +174,22 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
   Object? _hardwareFallbackCause;
   StreamSubscription<AndroidH264RenderedFrame>? _hardwareFrames;
   StreamSubscription<Object>? _hardwareErrors;
+  StreamSubscription<bool>? _hardwareSurfaceAvailability;
   final SplayTreeMap<int, TimestampedAccessUnit> _hardwareQueuedFrames =
       SplayTreeMap<int, TimestampedAccessUnit>();
   String _hardwareDecoderName = 'MediaCodec';
   final Stopwatch _abrHealthClock = Stopwatch()..start();
   int _lastAbrHealthSampleMs = -1000;
+  final PlaybackReliabilityTelemetry _telemetry =
+      PlaybackReliabilityTelemetry();
+  final ValueNotifier<String> _telemetryInfo = ValueNotifier<String>(
+    'Health: new session',
+  );
+  AppLifecycleState _appLifecycleState = AppLifecycleState.resumed;
+  bool _lifecycleSuspended = false;
+  bool _resumeAfterLifecycle = false;
+  bool _hardwareSurfaceUnavailable = false;
+  bool _hardwareSurfaceRecoveryRequired = false;
   String decodeInfo = '';
   String audioInfo = 'Audio: none';
 
@@ -252,15 +265,106 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
   @override
   void initState() {
     super.initState();
+    _appLifecycleState =
+        WidgetsBinding.instance.lifecycleState ?? AppLifecycleState.resumed;
+    WidgetsBinding.instance.addObserver(this);
     final hardware = hardwareDecoder;
     if (hardware != null) {
       _hardwareFrames = hardware.renderedFrames.listen(
         _handleHardwareFrameRendered,
       );
       _hardwareErrors = hardware.errors.listen(_handleHardwareDecoderError);
+      _hardwareSurfaceAvailability = hardware.surfaceAvailability.listen(
+        _handleHardwareSurfaceAvailability,
+      );
       unawaited(_probeHardwareVideo(hardware));
     }
     _configureDecodePump(rolling: false);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _appLifecycleState = state;
+    switch (state) {
+      case AppLifecycleState.resumed:
+        _resumeFromLifecycle();
+        return;
+      case AppLifecycleState.inactive:
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.paused:
+      case AppLifecycleState.detached:
+        _suspendForLifecycle();
+        return;
+    }
+  }
+
+  void _suspendForLifecycle() {
+    if (_lifecycleSuspended) return;
+    _lifecycleSuspended = true;
+    _resumeAfterLifecycle =
+        clock.isPlaying || (_audioController?.isPlaying ?? false);
+    unawaited(
+      _serializeTransport(() async {
+        if (!mounted) return;
+        final audio = _audioController;
+        if (audio != null && audio.isPlaying) await audio.pause();
+        clock.pause();
+        if (mounted) setState(() => decodeInfo = 'Paused in background');
+      }),
+    );
+  }
+
+  void _resumeFromLifecycle() {
+    if (!_lifecycleSuspended && !_hardwareSurfaceRecoveryRequired) return;
+    _lifecycleSuspended = false;
+    if (_hardwareSurfaceUnavailable) return;
+    final shouldResume = _resumeAfterLifecycle;
+    _resumeAfterLifecycle = false;
+    unawaited(
+      _serializeTransport(() async {
+        if (!mounted) return;
+        if (_hardwareSurfaceRecoveryRequired && _hardwareVideoActive) {
+          final targetIndex = _latestAccessUnitAtOrBefore(clock.nowMs);
+          final recovered =
+              targetIndex == null ||
+              await _seekToAccessUnit(
+                targetIndex,
+                resumeAfterSeekOverride: shouldResume,
+              );
+          if (recovered) {
+            _hardwareSurfaceRecoveryRequired = false;
+            _telemetry.recordDecoderRecovery();
+            _publishTelemetry();
+            if (mounted) append('MediaCodec surface restored from keyframe');
+          }
+          return;
+        }
+        if (shouldResume) await _play();
+      }),
+    );
+  }
+
+  void _handleHardwareSurfaceAvailability(bool available) {
+    if (!mounted) return;
+    _hardwareSurfaceUnavailable = !available;
+    if (!available) {
+      _hardwareSurfaceRecoveryRequired = true;
+      _suspendForLifecycle();
+      setState(() => decodeInfo = 'Restoring video surface…');
+      return;
+    }
+    if (_appLifecycleState == AppLifecycleState.resumed) {
+      _resumeFromLifecycle();
+    }
+  }
+
+  void _publishTelemetry() {
+    if (!mounted) return;
+    _telemetry.observeResidentAccessUnits(_decodePump.residentLength);
+    _telemetryInfo.value = _telemetry.summary(
+      droppedFrames: _decodePump.skippedDecodeCount,
+      coalescedFrames: frameRenderer.coalescedFrameCount,
+    );
   }
 
   Future<void> _probeHardwareVideo(AndroidH264TextureDecoder hardware) async {
@@ -385,6 +489,8 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
     if (!mounted || !_rollingHls || _rollingFailed) return;
     switch (state) {
       case SequentialDecodeQueueState.starved:
+        _telemetry.recordVideoStarvation(clock.nowMs);
+        _publishTelemetry();
         _sampleAbrBufferHealth(starved: true, force: true);
         if (!_rollingAudioClockLocked && clock.isPlaying) {
           _resumeVideoOnlyAfterStarvation = true;
@@ -393,6 +499,8 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
         setState(() => decodeInfo = 'Buffering video…');
         break;
       case SequentialDecodeQueueState.ready:
+        _telemetry.recordBufferRecovered(clock.nowMs);
+        _publishTelemetry();
         if (_resumeVideoOnlyAfterStarvation && !_rollingAudioClockLocked) {
           _resumeVideoOnlyAfterStarvation = false;
           clock.play(fromMs: clock.nowMs);
@@ -480,6 +588,7 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
       _decodePump.appendItems(accessUnits.sublist(offset, offset + count));
       _rollingVideoAccessUnits += count;
       offset += count;
+      _publishTelemetry();
     }
     _rollingLastIdrAccessUnitIndex = validatedLastIdr;
   }
@@ -539,6 +648,9 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
       outputHeight: renderSize.height,
       onFrame: (rgba) {
         if (!mounted) return;
+        _telemetry.recordPresentationUpdate();
+        _telemetry.recordBufferRecovered(au.ptsMs);
+        _publishTelemetry();
         current = au;
         final coalesced = frameRenderer.coalescedFrameCount;
         decodeInfo =
@@ -589,6 +701,9 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
       latenessMs: math.max(0, clock.nowMs - ptsMs),
     );
     current = accessUnit;
+    _telemetry.recordPresentationUpdate();
+    _telemetry.recordBufferRecovered(ptsMs);
+    _publishTelemetry();
     decodeInfo =
         'Hardware H.264 ($_hardwareDecoderName): '
         '${frame.width}x${frame.height}';
@@ -647,6 +762,8 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
       return;
     }
     if (mounted) {
+      _telemetry.recordDecoderRecovery();
+      _publishTelemetry();
       append('MediaCodec failed; resumed with the Pure Dart decoder: $error');
     }
   }
@@ -839,6 +956,8 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
 
   void _handleQualityDecision(HlsQualityChange change) {
     if (!mounted) return;
+    _telemetry.recordQualitySwitch();
+    _publishTelemetry();
     _refreshQualityInfo();
     append(
       'Quality target ${change.previous.label} -> ${change.current.label}: '
@@ -986,12 +1105,15 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _queueBuildEpoch++;
     unawaited(_cancelActiveHlsBuild());
     urlCtrl.dispose();
     _presentedVideo.dispose();
+    _telemetryInfo.dispose();
     unawaited(_hardwareFrames?.cancel());
     unawaited(_hardwareErrors?.cancel());
+    unawaited(_hardwareSurfaceAvailability?.cancel());
     clock.dispose();
     _decodePump.dispose();
     frameRenderer.dispose();
@@ -1016,6 +1138,9 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
     _hardwareVideoActive = _hardwareVideoSupported;
     _hardwareFallbackPending = false;
     _hardwareFallbackCause = null;
+    _hardwareSurfaceRecoveryRequired = false;
+    _telemetry.reset();
+    _publishTelemetry();
     setState(() {
       loading = true;
       log = '';
@@ -1324,6 +1449,8 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
           });
         }
       case AudioPlaybackEventType.underrun:
+        _telemetry.recordAudioUnderrun(event.mediaTimeUs ~/ 1000);
+        _publishTelemetry();
         _sampleAbrBufferHealth(starved: true, force: true);
         setState(() {
           audioInfo = 'Audio underrun: ${event.message ?? "buffer starved"}';
@@ -3069,6 +3196,17 @@ class _PureDartPlaybackScreenState extends State<PureDartPlaybackScreen> {
                       _qualityInfo,
                       key: const Key('quality-info'),
                       style: const TextStyle(fontFamily: 'monospace'),
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.only(left: 8),
+                    child: ValueListenableBuilder<String>(
+                      valueListenable: _telemetryInfo,
+                      builder: (context, value, _) => Text(
+                        value,
+                        key: const Key('playback-health'),
+                        style: const TextStyle(fontFamily: 'monospace'),
+                      ),
                     ),
                   ),
                 ],
