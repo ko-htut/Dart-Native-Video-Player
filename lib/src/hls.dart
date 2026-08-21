@@ -2,6 +2,8 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 
+typedef HlsByteFetcher = Future<Uint8List> Function(Uri uri);
+
 enum HlsPlaylistKind { master, media }
 
 class HlsVariant {
@@ -39,6 +41,63 @@ class HlsMediaPlaylist {
     required this.isEndList,
     required this.segments,
   });
+}
+
+/// Thrown when the VOD-only player receives a media-playlist snapshot that
+/// has not been finalized with `#EXT-X-ENDLIST`.
+///
+/// A playlist without the end-list tag can gain more segments after it was
+/// fetched. Treating that snapshot as complete would make playback stop at an
+/// arbitrary live edge, so callers must implement playlist refresh before
+/// opting in to parse such snapshots.
+final class HlsVodPlaylistRequiredException implements Exception {
+  const HlsVodPlaylistRequiredException(this.playlistUri);
+
+  final Uri playlistUri;
+
+  @override
+  String toString() =>
+      'HlsVodPlaylistRequiredException: $playlistUri is not a finalized HLS '
+      'VOD playlist (missing #EXT-X-ENDLIST). Live/event playlist refresh is '
+      'not supported yet.';
+}
+
+/// Thrown when a VOD crosses an HLS discontinuity boundary.
+///
+/// A discontinuity may reset the MPEG timestamp clock or change elementary
+/// stream configuration. Phase 2A deliberately rejects that transition until
+/// both audio and video timelines can be rebased onto one continuous clock.
+final class HlsDiscontinuityUnsupportedException implements Exception {
+  const HlsDiscontinuityUnsupportedException({
+    required this.firstSequence,
+    required this.discontinuitySequence,
+  });
+
+  final int firstSequence;
+  final int discontinuitySequence;
+
+  @override
+  String toString() =>
+      'HlsDiscontinuityUnsupportedException: media sequence $firstSequence '
+      'starts discontinuity epoch $discontinuitySequence. Timestamp-rebasing '
+      'across #EXT-X-DISCONTINUITY is not supported yet.';
+}
+
+/// Requires every segment in [playlist] to share one timestamp epoch.
+///
+/// A non-zero initial discontinuity sequence is valid; only an epoch change
+/// within the selected VOD is rejected.
+void requireSingleHlsDiscontinuityEpoch(HlsMediaPlaylist playlist) {
+  if (playlist.segments.isEmpty) return;
+  final firstEpoch = playlist.segments.first.discontinuitySequence;
+  for (final segment in playlist.segments.skip(1)) {
+    if (segment.discontinuitySequence != firstEpoch) {
+      throw HlsDiscontinuityUnsupportedException(
+        firstSequence: segment.sequence,
+        discontinuitySequence: segment.discontinuitySequence,
+      );
+    }
+  }
 }
 
 /// Returns the RFC 6381 codec identifiers advertised by an HLS variant.
@@ -226,20 +285,26 @@ Future<Uint8List> fetchBytes(Uri url) async {
   return res.bodyBytes;
 }
 
-Future<String> fetchText(Uri url) async {
-  final bytes = await fetchBytes(url);
+Future<String> fetchText(Uri url, {HlsByteFetcher? byteFetcher}) async {
+  final bytes = await (byteFetcher ?? fetchBytes)(url);
   return utf8.decode(bytes);
 }
 
-Future<HlsPlaylistKind> detectPlaylistKind(Uri url) async {
-  final text = await fetchText(url);
+Future<HlsPlaylistKind> detectPlaylistKind(
+  Uri url, {
+  HlsByteFetcher? byteFetcher,
+}) async {
+  final text = await fetchText(url, byteFetcher: byteFetcher);
   // If it has EXT-X-STREAM-INF, it's typically a master playlist
   if (text.contains('#EXT-X-STREAM-INF')) return HlsPlaylistKind.master;
   return HlsPlaylistKind.media;
 }
 
-Future<List<HlsVariant>> fetchHlsVariants(Uri masterUrl) async {
-  final text = await fetchText(masterUrl);
+Future<List<HlsVariant>> fetchHlsVariants(
+  Uri masterUrl, {
+  HlsByteFetcher? byteFetcher,
+}) async {
+  final text = await fetchText(masterUrl, byteFetcher: byteFetcher);
   final lines = text
       .split('\n')
       .map((l) => l.trim())
@@ -267,8 +332,17 @@ Future<List<HlsVariant>> fetchHlsVariants(Uri masterUrl) async {
   return variants;
 }
 
-Future<HlsMediaPlaylist> fetchMediaPlaylist(Uri playlistUrl) async {
-  final text = await fetchText(playlistUrl);
+/// Fetches and parses one media playlist for the VOD-only playback runtime.
+///
+/// The default rejects live/event snapshots that omit `#EXT-X-ENDLIST`.
+/// Playlist-refresh implementations may pass [requireEndList] as `false`, but
+/// must not treat the returned finite snapshot as the end of the presentation.
+Future<HlsMediaPlaylist> fetchMediaPlaylist(
+  Uri playlistUrl, {
+  HlsByteFetcher? byteFetcher,
+  bool requireEndList = true,
+}) async {
+  final text = await fetchText(playlistUrl, byteFetcher: byteFetcher);
   final lines = text.split('\n').map((l) => l.trim()).toList();
 
   int target = 0;
@@ -296,7 +370,7 @@ Future<HlsMediaPlaylist> fetchMediaPlaylist(Uri playlistUrl) async {
       final raw = line.substring('#EXTINF:'.length);
       final durStr = raw.split(',').first;
       pendingDur = double.parse(durStr);
-    } else if (line.startsWith('#EXT-X-ENDLIST')) {
+    } else if (line == '#EXT-X-ENDLIST') {
       endList = true;
     } else if (!line.startsWith('#')) {
       final dur = pendingDur ?? 0.0;
@@ -314,7 +388,7 @@ Future<HlsMediaPlaylist> fetchMediaPlaylist(Uri playlistUrl) async {
     }
   }
 
-  return HlsMediaPlaylist(
+  final playlist = HlsMediaPlaylist(
     targetDuration: target,
     mediaSequence: mediaSeq,
     discontinuitySequence: segments.isEmpty
@@ -323,6 +397,10 @@ Future<HlsMediaPlaylist> fetchMediaPlaylist(Uri playlistUrl) async {
     isEndList: endList,
     segments: segments,
   );
+  if (requireEndList && !playlist.isEndList) {
+    throw HlsVodPlaylistRequiredException(playlistUrl);
+  }
+  return playlist;
 }
 
 Map<String, String> _parseAttrs(String s) {

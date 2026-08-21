@@ -1,5 +1,7 @@
 import 'dart:typed_data';
 
+import '../../mpeg_timestamp_epoch.dart';
+
 import 'audio_specific_config.dart';
 
 /// Fixed and variable ADTS header fields for one AAC transport frame.
@@ -167,13 +169,28 @@ abstract final class AdtsParser {
 /// values are unwrapped across the MPEG 33-bit rollover. Between anchors, exact
 /// rational 90 kHz durations are accumulated without long-term rounding drift.
 final class AdtsStreamParser {
+  AdtsStreamParser({MpegTimestampEpochRebaser? timestampRebaser})
+    : _timestampRebaser = timestampRebaser ?? MpegTimestampEpochRebaser();
+
   Uint8List _buffer = Uint8List(0);
   int _bufferOffset = 0;
   final List<_PtsAnchor> _anchors = <_PtsAnchor>[];
   int? _nextPts;
   int _durationRemainder = 0;
+  final MpegTimestampEpochRebaser _timestampRebaser;
 
   int get bufferedByteCount => _buffer.length;
+  MpegTimestampEpochSnapshot? get currentTimestampEpoch =>
+      _timestampRebaser.currentEpochSnapshot;
+
+  /// Drops partial ADTS state and maps following PTS values through [epoch].
+  void beginTimestampEpoch(MpegTimestampEpoch epoch) {
+    _discardBufferedState();
+    _timestampRebaser.beginEpoch(
+      discontinuitySequence: epoch.discontinuitySequence,
+      sharedEpoch: epoch,
+    );
+  }
 
   List<AacAccessUnit> push(Uint8List chunk, {int? pts90k}) {
     final appendOffset = _bufferOffset + _buffer.length;
@@ -220,15 +237,26 @@ final class AdtsStreamParser {
       final absoluteFrameOffset = _bufferOffset + cursor;
       _applyAnchorsThrough(absoluteFrameOffset);
       final frameEnd = cursor + header.frameLength;
+      final outputPts90k = _nextPts;
       output.add(
         AacAccessUnit(
           payload: _buffer.sublist(cursor + header.headerLength, frameEnd),
           config: header.toAudioSpecificConfig(),
-          pts90k: _nextPts,
+          pts90k: outputPts90k,
           sampleCount: header.sampleCount,
         ),
       );
       _advanceTimestamp(header.sampleCount, header.samplingFrequency);
+      if (outputPts90k != null) {
+        _timestampRebaser.noteEmitted(
+          outputPts90k,
+          expectedCadence90k:
+              (header.sampleCount *
+                      mpegTimestampClockRate /
+                      header.samplingFrequency)
+                  .round(),
+        );
+      }
       cursor = frameEnd;
     }
 
@@ -251,6 +279,16 @@ final class AdtsStreamParser {
   }
 
   void reset() {
+    _discardBufferedState();
+    _timestampRebaser.reset();
+  }
+
+  /// Drops only an incomplete transport tail while retaining timeline state.
+  void discardIncompleteTail() {
+    _discardBufferedState();
+  }
+
+  void _discardBufferedState() {
     _buffer = Uint8List(0);
     _bufferOffset = 0;
     _anchors.clear();
@@ -268,7 +306,7 @@ final class AdtsStreamParser {
     }
     if (consumed == 0) return;
     _anchors.removeRange(0, consumed);
-    _nextPts = _unwrapPts(newest!, _nextPts);
+    _nextPts = _timestampRebaser.rebase(newest!);
     _durationRemainder = 0;
   }
 
@@ -288,23 +326,6 @@ final class _PtsAnchor {
 }
 
 const int _mpegClockRate = 90000;
-const int _ptsModulus = 1 << 33;
-const int _ptsMask = _ptsModulus - 1;
-const int _ptsHalfRange = _ptsModulus >> 1;
-
-int _unwrapPts(int value, int? reference) {
-  final raw = value & _ptsMask;
-  if (reference == null) return raw;
-  final referenceRaw = reference & _ptsMask;
-  var delta = raw - referenceRaw;
-  if (delta > _ptsHalfRange) {
-    delta -= _ptsModulus;
-  } else if (delta < -_ptsHalfRange) {
-    delta += _ptsModulus;
-  }
-  return reference + delta;
-}
-
 bool _isSyncWord(Uint8List bytes, int offset) {
   return offset >= 0 &&
       offset + 1 < bytes.length &&

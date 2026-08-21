@@ -19,16 +19,31 @@ final class TsPesAssembler {
   final int pid;
   BytesBuilder? _current;
   int? _lastContinuityCounter;
+  bool _segmentBoundaryPending = false;
 
   int continuityErrorCount = 0;
   int duplicatePacketCount = 0;
   int scrambledPacketCount = 0;
   int discontinuityCount = 0;
 
+  /// Marks the next payload packet as the first packet of a new HLS segment.
+  ///
+  /// Some otherwise valid MPEG-TS HLS encoders restart elementary-PID
+  /// continuity counters in every segment without setting the adaptation-field
+  /// discontinuity flag. A counter reset is accepted only when this first
+  /// payload packet also starts a new PES packet. The preceding PES candidate
+  /// is then closed normally (its declared length is still validated by the
+  /// PES parser); mid-PES resets remain corruption and discard the tail.
+  void beginSegment() {
+    _segmentBoundaryPending = true;
+  }
+
   List<Uint8List> pushPackets(Iterable<TsPacket> packets) {
     final completed = <Uint8List>[];
     for (final packet in packets) {
       if (packet.pid != pid || !packet.hasPayload) continue;
+      final isFirstSegmentPayload = _segmentBoundaryPending;
+      _segmentBoundaryPending = false;
 
       if (packet.transportScramblingControl != 0) {
         scrambledPacketCount++;
@@ -48,12 +63,15 @@ final class TsPesAssembler {
 
       final previousCounter = _lastContinuityCounter;
       if (previousCounter != null && packet.continuityCounter >= 0) {
-        if (packet.continuityCounter == previousCounter) {
+        final segmentCounterEpochStart =
+            isFirstSegmentPayload && packet.payloadUnitStart;
+        if (packet.continuityCounter == previousCounter &&
+            !segmentCounterEpochStart) {
           duplicatePacketCount++;
           continue;
         }
         final expected = (previousCounter + 1) & 0x0f;
-        if (packet.continuityCounter != expected) {
+        if (packet.continuityCounter != expected && !segmentCounterEpochStart) {
           continuityErrorCount++;
           discontinuityCount++;
           _discardPartial();
@@ -81,6 +99,7 @@ final class TsPesAssembler {
   void reset() {
     _current = null;
     _lastContinuityCounter = null;
+    _segmentBoundaryPending = false;
     continuityErrorCount = 0;
     duplicatePacketCount = 0;
     scrambledPacketCount = 0;

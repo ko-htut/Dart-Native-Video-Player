@@ -30,6 +30,40 @@ void main() {
   });
 
   test(
+    'file-backed MP4 decode is byte-exact with the timeline decode',
+    () async {
+      final bytes = File('assets/baby_aac.mp4').readAsBytesSync();
+      final track = Mp4Demux.parseAacTrack(bytes)!;
+      final timeline = decodeMp4AacToPcm(bytes, track);
+      final source = await decodeMp4AacToFilePcmInBackground(bytes, track);
+      final path = source.filePath;
+
+      expect(source.sampleRate, timeline.sampleRate);
+      expect(source.channels, timeline.channels);
+      expect(source.basePtsUs, timeline.basePtsUs);
+      expect(source.frameCount, timeline.frameCount);
+      expect(File(path).lengthSync(), timeline.samples.length * 2);
+
+      const framesPerRead = 4093;
+      var frame = 0;
+      while (frame < source.frameCount) {
+        final chunk = await source.readFrames(frame, maxFrames: framesPerRead);
+        final firstSample = frame * source.channels;
+        final lastSample = (frame + chunk.frameCount) * source.channels;
+        expect(
+          chunk.samples,
+          timeline.samples.sublist(firstSample, lastSample),
+          reason: 'PCM differs at frame $frame',
+        );
+        frame += chunk.frameCount;
+      }
+
+      await source.dispose();
+      expect(File(path).existsSync(), isFalse);
+    },
+  );
+
+  test(
     'aligns independently unwrapped audio across MPEG PTS rollover',
     () async {
       final bytes = File('assets/baby_aac.mp4').readAsBytesSync();
@@ -57,6 +91,15 @@ void main() {
       );
       expect(timeline.frameCount, 80 + 2 * 1024);
       expect(timeline.samples.take(80 * 2), everyElement(0));
+
+      final source = await decodeTransportAacToFilePcmInBackground(
+        units,
+        originPts90k: (1 << 33) - 100,
+      );
+      addTearDown(source.dispose);
+      expect(source.frameCount, timeline.frameCount);
+      final chunk = await source.readFrames(0, maxFrames: source.frameCount);
+      expect(chunk.samples, timeline.samples);
     },
   );
 }

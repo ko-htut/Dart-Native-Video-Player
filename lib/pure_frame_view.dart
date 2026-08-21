@@ -1,7 +1,8 @@
-import 'dart:typed_data';
-import 'package:flutter/material.dart';
-import 'dart:ui' as ui;
 import 'dart:async';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
+
+import 'package:flutter/material.dart';
 
 class PureFrameView extends StatefulWidget {
   final Uint8List rgba; // length = w*h*4
@@ -21,63 +22,122 @@ class PureFrameView extends StatefulWidget {
 
 class _PureFrameViewState extends State<PureFrameView> {
   ui.Image? _img;
-  int _decodeGeneration = 0;
+  int _imageWidth = 0;
+  int _imageHeight = 0;
+  _PendingRgbaFrame? _pendingFrame;
+  bool _decodeInFlight = false;
 
   @override
   void didUpdateWidget(covariant PureFrameView oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.rgba != widget.rgba) {
-      _makeImage();
+    if (!identical(oldWidget.rgba, widget.rgba) ||
+        oldWidget.width != widget.width ||
+        oldWidget.height != widget.height) {
+      _scheduleLatestFrame();
     }
   }
 
   @override
   void initState() {
     super.initState();
-    _makeImage();
+    _scheduleLatestFrame();
   }
 
-  Future<void> _makeImage() async {
-    final generation = ++_decodeGeneration;
-    final c = Completer<ui.Image>();
-    ui.decodeImageFromPixels(
-      widget.rgba,
-      widget.width,
-      widget.height,
-      ui.PixelFormat.rgba8888,
-      (img) => c.complete(img),
+  void _scheduleLatestFrame() {
+    _pendingFrame = _PendingRgbaFrame(
+      rgba: widget.rgba,
+      width: widget.width,
+      height: widget.height,
     );
-    final img = await c.future;
-    if (!mounted || generation != _decodeGeneration) {
-      img.dispose();
-      return;
+    _startDecodeIfNeeded();
+  }
+
+  void _startDecodeIfNeeded() {
+    if (_decodeInFlight || _pendingFrame == null || !mounted) return;
+    _decodeInFlight = true;
+    unawaited(_drainPendingFrames());
+  }
+
+  Future<void> _drainPendingFrames() async {
+    try {
+      while (mounted) {
+        final frame = _pendingFrame;
+        if (frame == null) return;
+        _pendingFrame = null;
+
+        final img = await _decodeFrame(frame);
+        if (!mounted) {
+          img.dispose();
+          return;
+        }
+
+        // A newer frame arrived while this conversion was running. Do not
+        // upload the stale result into the widget; decode only the newest
+        // pending snapshot on the next iteration.
+        if (_pendingFrame != null) {
+          img.dispose();
+          continue;
+        }
+
+        final previous = _img;
+        setState(() {
+          _img = img;
+          _imageWidth = frame.width;
+          _imageHeight = frame.height;
+        });
+        previous?.dispose();
+      }
+    } finally {
+      _decodeInFlight = false;
+      _startDecodeIfNeeded();
     }
-    final previous = _img;
-    setState(() => _img = img);
-    previous?.dispose();
+  }
+
+  Future<ui.Image> _decodeFrame(_PendingRgbaFrame frame) {
+    final completion = Completer<ui.Image>();
+    ui.decodeImageFromPixels(
+      frame.rgba,
+      frame.width,
+      frame.height,
+      ui.PixelFormat.rgba8888,
+      completion.complete,
+    );
+    return completion.future;
   }
 
   @override
   void dispose() {
-    _decodeGeneration++;
+    _pendingFrame = null;
     _img?.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_img == null) {
-      return const Center(child: CircularProgressIndicator());
-    }
-
-    return FittedBox(
-      fit: BoxFit.contain, // keep aspect ratio, fill as much as possible
-      alignment: Alignment.center,
-      child: SizedBox(
-        width: widget.width.toDouble(),
-        height: widget.height.toDouble(),
-        child: RawImage(image: _img, filterQuality: FilterQuality.none),
-      ),
+    return RepaintBoundary(
+      child: _img == null
+          ? const Center(child: CircularProgressIndicator())
+          : FittedBox(
+              fit: BoxFit.contain,
+              alignment: Alignment.center,
+              child: SizedBox(
+                width: _imageWidth.toDouble(),
+                height: _imageHeight.toDouble(),
+                child: RawImage(image: _img, filterQuality: FilterQuality.none),
+              ),
+            ),
     );
   }
+}
+
+final class _PendingRgbaFrame {
+  const _PendingRgbaFrame({
+    required this.rgba,
+    required this.width,
+    required this.height,
+  });
+
+  final Uint8List rgba;
+  final int width;
+  final int height;
 }

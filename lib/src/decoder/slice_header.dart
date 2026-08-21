@@ -46,6 +46,40 @@ class MemoryManagementOperation {
   });
 }
 
+/// One reference entry from `pred_weight_table()`.
+///
+/// Missing syntax flags are materialized as the normative identity weights so
+/// prediction code does not need to distinguish an omitted value from an
+/// explicitly signalled one.
+class PredictionWeight {
+  final int lumaWeight;
+  final int lumaOffset;
+  final List<int> chromaWeights;
+  final List<int> chromaOffsets;
+
+  const PredictionWeight({
+    required this.lumaWeight,
+    required this.lumaOffset,
+    required this.chromaWeights,
+    required this.chromaOffsets,
+  });
+}
+
+/// Explicit weighted-prediction parameters carried by a P/SP/B slice.
+class PredictionWeightTable {
+  final int lumaLog2WeightDenom;
+  final int chromaLog2WeightDenom;
+  final List<PredictionWeight> list0;
+  final List<PredictionWeight> list1;
+
+  const PredictionWeightTable({
+    required this.lumaLog2WeightDenom,
+    required this.chromaLog2WeightDenom,
+    required this.list0,
+    required this.list1,
+  });
+}
+
 /// Parsed slice header and a reader positioned at the first slice-data bit.
 class SliceHeader {
   final Uint8List nal;
@@ -65,13 +99,17 @@ class SliceHeader {
   final int? deltaPicOrderCnt0;
   final int? deltaPicOrderCnt1;
   final int? redundantPicCnt;
+  final bool directSpatialMvPredFlag;
   final int numRefIdxL0ActiveMinus1;
   final int numRefIdxL1ActiveMinus1;
   final List<RefPicListModification> refPicListModificationsL0;
+  final List<RefPicListModification> refPicListModificationsL1;
+  final PredictionWeightTable? predictionWeightTable;
   final bool noOutputOfPriorPicsFlag;
   final bool longTermReferenceFlag;
   final bool adaptiveRefPicMarkingModeFlag;
   final List<MemoryManagementOperation> memoryManagementOperations;
+  final int? cabacInitIdc;
   final int sliceQpDelta;
   final int sliceQpY;
   final int disableDeblockingFilterIdc;
@@ -97,13 +135,17 @@ class SliceHeader {
     required this.deltaPicOrderCnt0,
     required this.deltaPicOrderCnt1,
     required this.redundantPicCnt,
+    required this.directSpatialMvPredFlag,
     required this.numRefIdxL0ActiveMinus1,
     required this.numRefIdxL1ActiveMinus1,
     required this.refPicListModificationsL0,
+    required this.refPicListModificationsL1,
+    required this.predictionWeightTable,
     required this.noOutputOfPriorPicsFlag,
     required this.longTermReferenceFlag,
     required this.adaptiveRefPicMarkingModeFlag,
     required this.memoryManagementOperations,
+    required this.cabacInitIdc,
     required this.sliceQpDelta,
     required this.sliceQpY,
     required this.disableDeblockingFilterIdc,
@@ -176,7 +218,8 @@ SliceHeader parseSliceHeader(
 
   int? redundantPicCnt;
   if (pps.redundantPicCntPresentFlag) redundantPicCnt = readUE(reader);
-  if (sliceType == H264SliceType.b) reader.readBit();
+  final directSpatialMvPredFlag =
+      sliceType == H264SliceType.b && reader.readBit() == 1;
 
   var numRefIdxL0ActiveMinus1 = pps.numRefIdxL0DefaultActiveMinus1;
   var numRefIdxL1ActiveMinus1 = pps.numRefIdxL1DefaultActiveMinus1;
@@ -193,17 +236,19 @@ SliceHeader parseSliceHeader(
   }
 
   final modificationsL0 = <RefPicListModification>[];
+  final modificationsL1 = <RefPicListModification>[];
   if (!sliceType.isIntra) {
     _readRefPicListModifications(reader, modificationsL0);
     if (sliceType == H264SliceType.b) {
-      _readRefPicListModifications(reader, <RefPicListModification>[]);
+      _readRefPicListModifications(reader, modificationsL1);
     }
   }
 
+  PredictionWeightTable? predictionWeightTable;
   if ((pps.weightedPredFlag &&
           (sliceType == H264SliceType.p || sliceType == H264SliceType.sp)) ||
       (pps.weightedBipredIdc == 1 && sliceType == H264SliceType.b)) {
-    _skipPredWeightTable(
+    predictionWeightTable = _readPredWeightTable(
       reader,
       sps: sps,
       l0Count: numRefIdxL0ActiveMinus1 + 1,
@@ -254,8 +299,12 @@ SliceHeader parseSliceHeader(
     }
   }
 
+  int? cabacInitIdc;
   if (pps.entropyCodingModeFlag && !sliceType.isIntra) {
-    readUE(reader); // cabac_init_idc
+    cabacInitIdc = readUE(reader);
+    if (cabacInitIdc > 2) {
+      throw FormatException('Invalid cabac_init_idc=$cabacInitIdc');
+    }
   }
   final sliceQpDelta = readSE(reader);
   final sliceQpY = 26 + pps.picInitQpMinus26 + sliceQpDelta;
@@ -306,13 +355,23 @@ SliceHeader parseSliceHeader(
     deltaPicOrderCnt0: deltaPicOrderCnt0,
     deltaPicOrderCnt1: deltaPicOrderCnt1,
     redundantPicCnt: redundantPicCnt,
+    directSpatialMvPredFlag: directSpatialMvPredFlag,
     numRefIdxL0ActiveMinus1: numRefIdxL0ActiveMinus1,
     numRefIdxL1ActiveMinus1: numRefIdxL1ActiveMinus1,
-    refPicListModificationsL0: modificationsL0,
+    refPicListModificationsL0: List<RefPicListModification>.unmodifiable(
+      modificationsL0,
+    ),
+    refPicListModificationsL1: List<RefPicListModification>.unmodifiable(
+      modificationsL1,
+    ),
+    predictionWeightTable: predictionWeightTable,
     noOutputOfPriorPicsFlag: noOutputOfPriorPicsFlag,
     longTermReferenceFlag: longTermReferenceFlag,
     adaptiveRefPicMarkingModeFlag: adaptiveRefPicMarkingModeFlag,
-    memoryManagementOperations: memoryManagementOperations,
+    memoryManagementOperations: List<MemoryManagementOperation>.unmodifiable(
+      memoryManagementOperations,
+    ),
+    cabacInitIdc: cabacInitIdc,
     sliceQpDelta: sliceQpDelta,
     sliceQpY: sliceQpY,
     disableDeblockingFilterIdc: disableDeblockingFilterIdc,
@@ -337,30 +396,57 @@ void _readRefPicListModifications(
   }
 }
 
-void _skipPredWeightTable(
+PredictionWeightTable _readPredWeightTable(
   BitReader reader, {
   required SpsInfo sps,
   required int l0Count,
   required int l1Count,
 }) {
-  readUE(reader); // luma_log2_weight_denom
-  if (sps.chromaFormatIdc != 0) readUE(reader);
-
-  void skipList(int count) {
-    for (var i = 0; i < count; i++) {
-      if (reader.readBit() == 1) {
-        readSE(reader);
-        readSE(reader);
-      }
-      if (sps.chromaFormatIdc != 0 && reader.readBit() == 1) {
-        for (var component = 0; component < 2; component++) {
-          readSE(reader);
-          readSE(reader);
-        }
-      }
-    }
+  final lumaLog2WeightDenom = readUE(reader);
+  final chromaLog2WeightDenom = sps.chromaFormatIdc == 0 ? 0 : readUE(reader);
+  if (lumaLog2WeightDenom > 7 || chromaLog2WeightDenom > 7) {
+    throw FormatException(
+      'Invalid prediction weight denominators '
+      'luma=$lumaLog2WeightDenom chroma=$chromaLog2WeightDenom',
+    );
   }
 
-  skipList(l0Count);
-  skipList(l1Count);
+  List<PredictionWeight> readList(int count) {
+    final output = <PredictionWeight>[];
+    for (var i = 0; i < count; i++) {
+      var lumaWeight = 1 << lumaLog2WeightDenom;
+      var lumaOffset = 0;
+      if (reader.readBit() == 1) {
+        lumaWeight = readSE(reader);
+        lumaOffset = readSE(reader);
+      }
+      final chromaWeights = <int>[
+        1 << chromaLog2WeightDenom,
+        1 << chromaLog2WeightDenom,
+      ];
+      final chromaOffsets = <int>[0, 0];
+      if (sps.chromaFormatIdc != 0 && reader.readBit() == 1) {
+        for (var component = 0; component < 2; component++) {
+          chromaWeights[component] = readSE(reader);
+          chromaOffsets[component] = readSE(reader);
+        }
+      }
+      output.add(
+        PredictionWeight(
+          lumaWeight: lumaWeight,
+          lumaOffset: lumaOffset,
+          chromaWeights: List<int>.unmodifiable(chromaWeights),
+          chromaOffsets: List<int>.unmodifiable(chromaOffsets),
+        ),
+      );
+    }
+    return List<PredictionWeight>.unmodifiable(output);
+  }
+
+  return PredictionWeightTable(
+    lumaLog2WeightDenom: lumaLog2WeightDenom,
+    chromaLog2WeightDenom: chromaLog2WeightDenom,
+    list0: readList(l0Count),
+    list1: readList(l1Count),
+  );
 }

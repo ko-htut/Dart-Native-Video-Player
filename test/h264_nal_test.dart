@@ -48,6 +48,120 @@ List<int> _types(AccessUnit accessUnit) =>
     accessUnit.nals.map(nalType).toList(growable: false);
 
 void main() {
+  group('late-playback discard classification', () {
+    Uint8List slice({required int sliceType, required int nalRefIdc}) =>
+        _nalFromBits(1, '${_ueBits(0)}${_ueBits(sliceType)}${_ueBits(0)}')
+          ..[0] = (nalRefIdc << 5) | 1;
+
+    test('accepts only complete non-reference B access units', () {
+      final nonReferenceB = slice(sliceType: 1, nalRefIdc: 0);
+      expect(
+        isDisposableNonReferenceBAccessUnit(<Uint8List>[
+          _nal(9),
+          nonReferenceB,
+        ]),
+        isTrue,
+      );
+      expect(
+        isDisposableNonReferenceBAccessUnit(<Uint8List>[
+          nonReferenceB,
+          slice(sliceType: 1, nalRefIdc: 0),
+        ]),
+        isTrue,
+      );
+    });
+
+    test('fails closed for references, non-B slices, and parameter sets', () {
+      final nonReferenceB = slice(sliceType: 1, nalRefIdc: 0);
+      expect(
+        isDisposableNonReferenceBAccessUnit(<Uint8List>[
+          slice(sliceType: 1, nalRefIdc: 2),
+        ]),
+        isFalse,
+      );
+      expect(
+        isDisposableNonReferenceBAccessUnit(<Uint8List>[
+          slice(sliceType: 0, nalRefIdc: 0),
+        ]),
+        isFalse,
+      );
+      expect(
+        isDisposableNonReferenceBAccessUnit(<Uint8List>[
+          _nal(7),
+          nonReferenceB,
+        ]),
+        isFalse,
+      );
+      expect(
+        isDisposableNonReferenceBAccessUnit(<Uint8List>[
+          Uint8List.fromList(<int>[0x01]),
+        ]),
+        isFalse,
+      );
+      final forbiddenHeader = Uint8List.fromList(nonReferenceB)..[0] |= 0x80;
+      expect(
+        isDisposableNonReferenceBAccessUnit(<Uint8List>[forbiddenHeader]),
+        isFalse,
+      );
+      expect(
+        isDisposableNonReferenceBAccessUnit(<Uint8List>[
+          slice(sliceType: 1, nalRefIdc: 0),
+          _nalFromBits(1, '${_ueBits(0)}${_ueBits(1)}${_ueBits(1)}')
+            ..[0] = 0x01,
+        ]),
+        isFalse,
+      );
+    });
+
+    test('proactively skips disposable B at high resolution', () {
+      final nonReferenceB = slice(sliceType: 1, nalRefIdc: 0);
+
+      expect(
+        shouldSkipH264AccessUnitForSmoothPlayback(
+          nals: <Uint8List>[nonReferenceB],
+          latenessMs: 0,
+          highResolution: true,
+        ),
+        isTrue,
+      );
+      expect(
+        shouldSkipH264AccessUnitForSmoothPlayback(
+          nals: <Uint8List>[nonReferenceB],
+          latenessMs: 0,
+          highResolution: false,
+        ),
+        isFalse,
+      );
+      expect(
+        shouldSkipH264AccessUnitForSmoothPlayback(
+          nals: <Uint8List>[nonReferenceB],
+          latenessMs: 100,
+          highResolution: false,
+        ),
+        isTrue,
+      );
+    });
+
+    test('never skips reference B or P pictures for performance', () {
+      expect(
+        shouldSkipH264AccessUnitForSmoothPlayback(
+          nals: <Uint8List>[slice(sliceType: 1, nalRefIdc: 2)],
+          latenessMs: 1000,
+          highResolution: true,
+        ),
+        isFalse,
+      );
+      expect(
+        shouldSkipH264AccessUnitForSmoothPlayback(
+          nals: <Uint8List>[slice(sliceType: 0, nalRefIdc: 0)],
+          latenessMs: 1000,
+          highResolution: true,
+        ),
+        isFalse,
+      );
+    });
+  });
+
   group('Annex-B scanner', () {
     test('handles mixed start codes and trims all delimiter zero bytes', () {
       final stream = Uint8List.fromList(<int>[

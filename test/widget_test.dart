@@ -36,12 +36,22 @@ void main() {
         tester.widget(find.byKey(const Key('build-hls')));
     FilledButton mp4Button() =>
         tester.widget(find.byKey(const Key('build-mp4')));
+    FilledButton cancelButton() =>
+        tester.widget(find.byKey(const Key('cancel-build')));
+    DropdownButton<String> qualitySelector() =>
+        tester.widget(find.byKey(const Key('hls-quality')));
+
+    expect(cancelButton().onPressed, isNull);
+    expect(qualitySelector().value, 'auto');
+    expect(qualitySelector().items, hasLength(1));
+    expect(qualitySelector().onChanged, isNotNull);
 
     await tester.enterText(find.byType(TextField), 'assets/butterfly_dart.mp4');
     await tester.pump();
 
     expect(hlsButton().onPressed, isNull);
     expect(mp4Button().onPressed, isNotNull);
+    expect(qualitySelector().onChanged, isNull);
 
     await tester.enterText(
       find.byType(TextField),
@@ -51,5 +61,29 @@ void main() {
 
     expect(hlsButton().onPressed, isNotNull);
     expect(mp4Button().onPressed, isNull);
+    expect(cancelButton().onPressed, isNull);
+    expect(qualitySelector().onChanged, isNotNull);
+  });
+
+  testWidgets('an in-progress queue build can be cancelled', (tester) async {
+    await tester.pumpWidget(const App());
+    await tester.enterText(find.byType(TextField), 'assets/butterfly_dart.mp4');
+    await tester.pump();
+
+    await tester.tap(find.byKey(const Key('build-mp4')));
+    await tester.pump();
+
+    final cancelFinder = find.byKey(const Key('cancel-build'));
+    expect(tester.widget<FilledButton>(cancelFinder).onPressed, isNotNull);
+
+    await tester.tap(cancelFinder);
+    await tester.pump();
+
+    expect(tester.widget<FilledButton>(cancelFinder).onPressed, isNull);
+    expect(find.textContaining('Queue build cancelled'), findsOneWidget);
+    expect(
+      tester.widget<FilledButton>(find.byKey(const Key('build-mp4'))).onPressed,
+      isNotNull,
+    );
   });
 }

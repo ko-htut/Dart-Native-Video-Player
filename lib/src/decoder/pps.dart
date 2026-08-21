@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'bitreader.dart';
 import 'exp_golomb.dart';
 import 'rbsp.dart';
+import 'scaling_list_syntax.dart';
 
 class PpsInfo {
   final int ppsId;
@@ -26,6 +27,7 @@ class PpsInfo {
   final bool redundantPicCntPresentFlag;
   final bool transform8x8ModeFlag;
   final bool picScalingMatrixPresentFlag;
+  final List<H264ScalingListSyntax> scalingLists;
   final int secondChromaQpIndexOffset;
 
   const PpsInfo({
@@ -50,22 +52,47 @@ class PpsInfo {
     required this.redundantPicCntPresentFlag,
     required this.transform8x8ModeFlag,
     required this.picScalingMatrixPresentFlag,
+    this.scalingLists = const <H264ScalingListSyntax>[],
     required this.secondChromaQpIndexOffset,
   });
+
+  /// True when picture-level fallback rule B inherits matrices from the SPS.
+  bool get inheritsSequenceScalingMatrices => !picScalingMatrixPresentFlag;
+
+  bool get hasExplicitScalingLists =>
+      scalingLists.any((list) => list.isExplicit);
 }
 
 PpsInfo parsePpsNal(Uint8List nal, {int chromaFormatIdc = 1}) {
-  if (nal.length < 2 || (nal.first & 0x1f) != 8) {
+  if (nal.length < 2 || (nal.first & 0x80) != 0 || (nal.first & 0x1f) != 8) {
     throw const FormatException('PPS NAL is missing or has the wrong NAL type');
+  }
+  if (chromaFormatIdc < 0 || chromaFormatIdc > 3) {
+    throw ArgumentError.value(
+      chromaFormatIdc,
+      'chromaFormatIdc',
+      'must be 0..3',
+    );
   }
 
   final br = BitReader(ebspToRbsp(Uint8List.sublistView(nal, 1)));
   final ppsId = readUE(br);
   final spsId = readUE(br);
+  if (ppsId > 255) {
+    throw FormatException('pic_parameter_set_id=$ppsId exceeds 255');
+  }
+  if (spsId > 31) {
+    throw FormatException('seq_parameter_set_id=$spsId exceeds 31');
+  }
   final entropyCodingModeFlag = br.readBit() == 1;
   final bottomFieldPicOrderInFramePresentFlag = br.readBit() == 1;
 
   final numSliceGroupsMinus1 = readUE(br);
+  if (numSliceGroupsMinus1 > 7) {
+    throw FormatException(
+      'num_slice_groups_minus1=$numSliceGroupsMinus1 exceeds 7',
+    );
+  }
   var sliceGroupMapType = 0;
   var sliceGroupChangeDirectionFlag = false;
   var sliceGroupChangeRateMinus1 = 0;
@@ -78,6 +105,9 @@ PpsInfo parsePpsNal(Uint8List nal, {int chromaFormatIdc = 1}) {
         for (var i = 0; i <= numSliceGroupsMinus1; i++) {
           readUE(br); // run_length_minus1[i]
         }
+        break;
+      case 1:
+        // Dispersed slice groups have no additional PPS syntax elements.
         break;
       case 2:
         for (var i = 0; i < numSliceGroupsMinus1; i++) {
@@ -107,32 +137,52 @@ PpsInfo parsePpsNal(Uint8List nal, {int chromaFormatIdc = 1}) {
 
   final numRefIdxL0DefaultActiveMinus1 = readUE(br);
   final numRefIdxL1DefaultActiveMinus1 = readUE(br);
+  if (numRefIdxL0DefaultActiveMinus1 > 31 ||
+      numRefIdxL1DefaultActiveMinus1 > 31) {
+    throw FormatException(
+      'Default reference count exceeds 32: '
+      'L0=${numRefIdxL0DefaultActiveMinus1 + 1}, '
+      'L1=${numRefIdxL1DefaultActiveMinus1 + 1}',
+    );
+  }
   final weightedPredFlag = br.readBit() == 1;
   final weightedBipredIdc = br.readBits(2);
+  if (weightedBipredIdc > 2) {
+    throw FormatException('weighted_bipred_idc=$weightedBipredIdc is reserved');
+  }
   final picInitQpMinus26 = readSE(br);
   final picInitQsMinus26 = readSE(br);
   final chromaQpIndexOffset = readSE(br);
+  if (picInitQpMinus26 < -26 || picInitQpMinus26 > 25) {
+    throw FormatException('pic_init_qp_minus26=$picInitQpMinus26 is invalid');
+  }
+  if (picInitQsMinus26 < -26 || picInitQsMinus26 > 25) {
+    throw FormatException('pic_init_qs_minus26=$picInitQsMinus26 is invalid');
+  }
+  _validateChromaQpOffset(chromaQpIndexOffset, 'chroma_qp_index_offset');
   final deblockingFilterControlPresentFlag = br.readBit() == 1;
   final constrainedIntraPredFlag = br.readBit() == 1;
   final redundantPicCntPresentFlag = br.readBit() == 1;
 
   var transform8x8ModeFlag = false;
   var picScalingMatrixPresentFlag = false;
+  var scalingLists = _absentScalingLists(6);
   var secondChromaQpIndexOffset = chromaQpIndexOffset;
   if (moreRbspData(br)) {
     transform8x8ModeFlag = br.readBit() == 1;
     picScalingMatrixPresentFlag = br.readBit() == 1;
-    if (picScalingMatrixPresentFlag) {
-      final count =
-          6 + (transform8x8ModeFlag ? (chromaFormatIdc == 3 ? 6 : 2) : 0);
-      for (var i = 0; i < count; i++) {
-        if (br.readBit() == 1) {
-          _skipScalingList(br, i < 6 ? 16 : 64);
-        }
-      }
-    }
+    final count =
+        6 + (transform8x8ModeFlag ? (chromaFormatIdc == 3 ? 6 : 2) : 0);
+    scalingLists = picScalingMatrixPresentFlag
+        ? _readScalingLists(br, count)
+        : _absentScalingLists(count);
     secondChromaQpIndexOffset = readSE(br);
+    _validateChromaQpOffset(
+      secondChromaQpIndexOffset,
+      'second_chroma_qp_index_offset',
+    );
   }
+  readRbspTrailingBits(br);
 
   return PpsInfo(
     ppsId: ppsId,
@@ -157,6 +207,7 @@ PpsInfo parsePpsNal(Uint8List nal, {int chromaFormatIdc = 1}) {
     redundantPicCntPresentFlag: redundantPicCntPresentFlag,
     transform8x8ModeFlag: transform8x8ModeFlag,
     picScalingMatrixPresentFlag: picScalingMatrixPresentFlag,
+    scalingLists: List<H264ScalingListSyntax>.unmodifiable(scalingLists),
     secondChromaQpIndexOffset: secondChromaQpIndexOffset,
   );
 }
@@ -171,13 +222,25 @@ int _ceilLog2(int value) {
   return bits;
 }
 
-void _skipScalingList(BitReader br, int size) {
-  var lastScale = 8;
-  var nextScale = 8;
-  for (var j = 0; j < size; j++) {
-    if (nextScale != 0) {
-      nextScale = (lastScale + readSE(br)) & 0xff;
-    }
-    if (nextScale != 0) lastScale = nextScale;
+List<H264ScalingListSyntax> _readScalingLists(BitReader reader, int count) {
+  return <H264ScalingListSyntax>[
+    for (var index = 0; index < count; index++)
+      if (reader.readBit() == 1)
+        H264ScalingListSyntax.parse(reader, size: index < 6 ? 16 : 64)
+      else
+        H264ScalingListSyntax.absent(index < 6 ? 16 : 64),
+  ];
+}
+
+List<H264ScalingListSyntax> _absentScalingLists(int count) {
+  return <H264ScalingListSyntax>[
+    for (var index = 0; index < count; index++)
+      H264ScalingListSyntax.absent(index < 6 ? 16 : 64),
+  ];
+}
+
+void _validateChromaQpOffset(int value, String name) {
+  if (value < -12 || value > 12) {
+    throw FormatException('$name=$value is outside -12..12');
   }
 }

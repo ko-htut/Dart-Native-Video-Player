@@ -12,22 +12,41 @@ final class H264MotionVector {
 
 /// Information used to derive boundary strength for one luma 4x4 block.
 ///
-/// [referencePictureId] is optional because a decoder with an unreordered P
-/// reference list can compare [referenceIndexL0] directly.  When either side
-/// supplies a picture id, both sides must supply the same id to be considered
-/// the same reference picture.
+/// [referencePictureId] is the legacy name for [referencePictureIdL0]. Stable
+/// picture ids are optional for an unreordered P reference list, which can
+/// compare [referenceIndexL0] directly. B pictures should provide ids for both
+/// used lists because list-relative indices cannot identify a picture after
+/// independent List0/List1 reordering.
 final class H264DeblockingBlock {
   const H264DeblockingBlock({
     this.totalCoeff = 0,
     this.referenceIndexL0 = 0,
-    this.referencePictureId,
+    int? referencePictureId,
+    int? referencePictureIdL0,
     this.motionVectorL0 = H264MotionVector.zero,
-  });
+    this.referenceIndexL1 = -1,
+    this.referencePictureIdL1,
+    this.motionVectorL1 = H264MotionVector.zero,
+  }) : assert(
+         referencePictureId == null ||
+             referencePictureIdL0 == null ||
+             referencePictureId == referencePictureIdL0,
+         'referencePictureId and referencePictureIdL0 disagree',
+       ),
+       referencePictureId = referencePictureIdL0 ?? referencePictureId;
 
   final int totalCoeff;
   final int referenceIndexL0;
+
+  /// Stable List0 picture identity; retained under its original API name.
   final int? referencePictureId;
   final H264MotionVector motionVectorL0;
+  final int referenceIndexL1;
+  final int? referencePictureIdL1;
+  final H264MotionVector motionVectorL1;
+
+  /// Explicit List0 alias for dual-list callers.
+  int? get referencePictureIdL0 => referencePictureId;
 
   bool get hasResidual => totalCoeff != 0;
 
@@ -38,7 +57,91 @@ final class H264DeblockingBlock {
     }
     return referenceIndexL0 == other.referenceIndexL0;
   }
+
+  /// Whether the unordered List0/List1 reference pairs identify the same
+  /// pictures.
+  ///
+  /// This accepts either the straight L0/L0 + L1/L1 correspondence or the
+  /// swapped L0/L1 + L1/L0 correspondence used by B prediction. Without stable
+  /// ids, fallback indices are comparable only within their originating list.
+  bool hasEquivalentReferencePairAs(H264DeblockingBlock other) {
+    return _referencePairMatches(this, other, swapped: false) ||
+        _referencePairMatches(this, other, swapped: true);
+  }
+
+  bool _hasEquivalentInterPredictionAs(H264DeblockingBlock other) {
+    return _predictionPairMatches(this, other, swapped: false) ||
+        _predictionPairMatches(this, other, swapped: true);
+  }
 }
+
+bool _referencePairMatches(
+  H264DeblockingBlock p,
+  H264DeblockingBlock q, {
+  required bool swapped,
+}) {
+  final qListForP0 = swapped ? 1 : 0;
+  final qListForP1 = swapped ? 0 : 1;
+  return _sameReference(p, 0, q, qListForP0) &&
+      _sameReference(p, 1, q, qListForP1);
+}
+
+bool _predictionPairMatches(
+  H264DeblockingBlock p,
+  H264DeblockingBlock q, {
+  required bool swapped,
+}) {
+  final qListForP0 = swapped ? 1 : 0;
+  final qListForP1 = swapped ? 0 : 1;
+  return _referencePairMatches(p, q, swapped: swapped) &&
+      !_motionDiffers(p, 0, q, qListForP0) &&
+      !_motionDiffers(p, 1, q, qListForP1);
+}
+
+bool _sameReference(
+  H264DeblockingBlock left,
+  int leftList,
+  H264DeblockingBlock right,
+  int rightList,
+) {
+  final leftIndex = _referenceIndex(left, leftList);
+  final rightIndex = _referenceIndex(right, rightList);
+  final leftIsUsed = leftIndex >= 0;
+  final rightIsUsed = rightIndex >= 0;
+  if (leftIsUsed != rightIsUsed) return false;
+  if (!leftIsUsed) return true;
+  final leftPictureId = _referencePictureId(left, leftList);
+  final rightPictureId = _referencePictureId(right, rightList);
+  if (leftPictureId != null || rightPictureId != null) {
+    return leftPictureId != null && leftPictureId == rightPictureId;
+  }
+  return leftList == rightList && leftIndex == rightIndex;
+}
+
+bool _motionDiffers(
+  H264DeblockingBlock left,
+  int leftList,
+  H264DeblockingBlock right,
+  int rightList,
+) {
+  if (_referenceIndex(left, leftList) < 0 &&
+      _referenceIndex(right, rightList) < 0) {
+    return false;
+  }
+  final leftMotion = _motionVector(left, leftList);
+  final rightMotion = _motionVector(right, rightList);
+  return (leftMotion.x - rightMotion.x).abs() >= 4 ||
+      (leftMotion.y - rightMotion.y).abs() >= 4;
+}
+
+int _referenceIndex(H264DeblockingBlock block, int list) =>
+    list == 0 ? block.referenceIndexL0 : block.referenceIndexL1;
+
+int? _referencePictureId(H264DeblockingBlock block, int list) =>
+    list == 0 ? block.referencePictureId : block.referencePictureIdL1;
+
+H264MotionVector _motionVector(H264DeblockingBlock block, int list) =>
+    list == 0 ? block.motionVectorL0 : block.motionVectorL1;
 
 /// Deblocking metadata for one 16x16 luma / 8x8 chroma macroblock.
 ///
@@ -55,6 +158,7 @@ final class H264DeblockingMacroblock {
     required this.qpCb,
     required this.qpCr,
     required this.lumaBlocks,
+    this.transformSize8x8 = false,
     this.cbTotalCoeff = const <int>[0, 0, 0, 0],
     this.crTotalCoeff = const <int>[0, 0, 0, 0],
     this.sliceId = 0,
@@ -65,6 +169,13 @@ final class H264DeblockingMacroblock {
   final int qpCb;
   final int qpCr;
   final List<H264DeblockingBlock> lumaBlocks;
+
+  /// Whether this macroblock uses 8x8 luma transform blocks.
+  ///
+  /// H.264 does not filter the internal luma 4x4 edges at sample offsets 4 and
+  /// 12 in this case. The external edge and the internal edge at offset 8 are
+  /// unchanged, as are the 4:2:0 chroma edges.
+  final bool transformSize8x8;
   final List<int> cbTotalCoeff;
   final List<int> crTotalCoeff;
   final int sliceId;
@@ -158,6 +269,9 @@ abstract final class H264DeblockingFilter {
         // H.264 specifies all vertical edges of a macroblock before all of its
         // horizontal edges.  The ordering matters because filtering is in-loop.
         for (var edge = 0; edge < 4; edge++) {
+          if (current.transformSize8x8 && edge.isOdd) {
+            continue;
+          }
           if (!_verticalEdgeAvailable(
             edge: edge,
             mbX: mbX,
@@ -233,6 +347,9 @@ abstract final class H264DeblockingFilter {
         }
 
         for (var edge = 0; edge < 4; edge++) {
+          if (current.transformSize8x8 && edge.isOdd) {
+            continue;
+          }
           if (!_horizontalEdgeAvailable(
             edge: edge,
             mbX: mbX,
@@ -325,12 +442,11 @@ abstract final class H264DeblockingFilter {
     if (p.hasResidual || q.hasResidual) {
       return 2;
     }
-    if (!p.hasSameReferenceAs(q)) {
-      return 1;
-    }
-    final pMv = p.motionVectorL0;
-    final qMv = q.motionVectorL0;
-    if ((pMv.x - qMv.x).abs() >= 4 || (pMv.y - qMv.y).abs() >= 4) {
+    // H.264 8.7.2.1 treats a B reference pair as unordered. Motion vectors are
+    // compared using whichever straight or swapped reference correspondence
+    // matches; when both are possible, either matching correspondence can
+    // establish equivalence.
+    if (!p._hasEquivalentInterPredictionAs(q)) {
       return 1;
     }
     return 0;

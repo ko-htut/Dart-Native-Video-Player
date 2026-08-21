@@ -436,20 +436,59 @@ void writeLumaInterPrediction({
     destinationWidth,
     destinationHeight,
   );
+  if (motionVector.x % 4 == 0 && motionVector.y % 4 == 0) {
+    _copyIntegerPrediction(
+      reference: reference,
+      referenceWidth: referenceWidth,
+      referenceHeight: referenceHeight,
+      referenceStride: referenceStride ?? referenceWidth,
+      destination: destination,
+      destinationStride: dstStride,
+      destinationX: destinationX,
+      destinationY: destinationY,
+      partitionWidth: partitionWidth,
+      partitionHeight: partitionHeight,
+      sourceX: destinationX + motionVector.x ~/ 4,
+      sourceY: destinationY + motionVector.y ~/ 4,
+    );
+    return;
+  }
   final sampler = _LumaSampler(
     reference,
     referenceWidth,
     referenceHeight,
     referenceStride ?? referenceWidth,
   );
+  final motionBaseX = _floorDiv(motionVector.x, 4);
+  final motionBaseY = _floorDiv(motionVector.y, 4);
+  final xFraction = motionVector.x - motionBaseX * 4;
+  final yFraction = motionVector.y - motionBaseY * 4;
+  final sourceX = destinationX + motionBaseX;
+  final sourceY = destinationY + motionBaseY;
+  final canUseUnclippedSixTap =
+      sourceX >= 2 &&
+      sourceY >= 2 &&
+      sourceX + partitionWidth + 2 < referenceWidth &&
+      sourceY + partitionHeight + 2 < referenceHeight;
   for (var y = 0; y < partitionHeight; y++) {
     final dstRow = (destinationY + y) * dstStride + destinationX;
-    final referenceY = (destinationY + y) * 4 + motionVector.y;
-    for (var x = 0; x < partitionWidth; x++) {
-      destination[dstRow + x] = sampler.sample(
-        (destinationX + x) * 4 + motionVector.x,
-        referenceY,
-      );
+    if (canUseUnclippedSixTap) {
+      for (var x = 0; x < partitionWidth; x++) {
+        destination[dstRow + x] = sampler.sampleUnclipped(
+          sourceX + x,
+          sourceY + y,
+          xFraction,
+          yFraction,
+        );
+      }
+    } else {
+      final referenceY = (destinationY + y) * 4 + motionVector.y;
+      for (var x = 0; x < partitionWidth; x++) {
+        destination[dstRow + x] = sampler.sample(
+          (destinationX + x) * 4 + motionVector.x,
+          referenceY,
+        );
+      }
     }
   }
 }
@@ -494,11 +533,85 @@ void writeChromaInterPrediction({
     destinationWidth,
     destinationHeight,
   );
+  if (motionVector.x % 8 == 0 && motionVector.y % 8 == 0) {
+    _copyIntegerPrediction(
+      reference: reference,
+      referenceWidth: referenceWidth,
+      referenceHeight: referenceHeight,
+      referenceStride: referenceStride ?? referenceWidth,
+      destination: destination,
+      destinationStride: dstStride,
+      destinationX: chromaX,
+      destinationY: chromaY,
+      partitionWidth: chromaWidth,
+      partitionHeight: chromaHeight,
+      sourceX: chromaX + motionVector.x ~/ 8,
+      sourceY: chromaY + motionVector.y ~/ 8,
+    );
+    return;
+  }
+  final refStride = referenceStride ?? referenceWidth;
+  final motionBaseX = _floorDiv(motionVector.x, 8);
+  final motionBaseY = _floorDiv(motionVector.y, 8);
+  final xFraction = motionVector.x - motionBaseX * 8;
+  final yFraction = motionVector.y - motionBaseY * 8;
+  final sourceX = chromaX + motionBaseX;
+  final sourceY = chromaY + motionBaseY;
+  final sourceMaxX = sourceX + chromaWidth - 1 + (xFraction == 0 ? 0 : 1);
+  final sourceMaxY = sourceY + chromaHeight - 1 + (yFraction == 0 ? 0 : 1);
+
+  // Motion fractions are constant over the whole partition. Most blocks are
+  // fully in-picture, so compute them once and index the planes directly
+  // instead of repeating floor division and four clipped lookups per sample.
+  if (sourceX >= 0 &&
+      sourceY >= 0 &&
+      sourceMaxX < referenceWidth &&
+      sourceMaxY < referenceHeight) {
+    final inverseX = 8 - xFraction;
+    final inverseY = 8 - yFraction;
+    for (var y = 0; y < chromaHeight; y++) {
+      final dstRow = (chromaY + y) * dstStride + chromaX;
+      final sourceRow = (sourceY + y) * refStride + sourceX;
+      if (yFraction == 0) {
+        for (var x = 0; x < chromaWidth; x++) {
+          final offset = sourceRow + x;
+          destination[dstRow + x] =
+              (inverseX * reference[offset] +
+                  xFraction * reference[offset + 1] +
+                  4) >>
+              3;
+        }
+      } else if (xFraction == 0) {
+        final nextRow = sourceRow + refStride;
+        for (var x = 0; x < chromaWidth; x++) {
+          destination[dstRow + x] =
+              (inverseY * reference[sourceRow + x] +
+                  yFraction * reference[nextRow + x] +
+                  4) >>
+              3;
+        }
+      } else {
+        final nextRow = sourceRow + refStride;
+        for (var x = 0; x < chromaWidth; x++) {
+          final offset = sourceRow + x;
+          destination[dstRow + x] =
+              (inverseX * inverseY * reference[offset] +
+                  xFraction * inverseY * reference[offset + 1] +
+                  inverseX * yFraction * reference[nextRow + x] +
+                  xFraction * yFraction * reference[nextRow + x + 1] +
+                  32) >>
+              6;
+        }
+      }
+    }
+    return;
+  }
+
   final sampler = _ChromaSampler(
     reference,
     referenceWidth,
     referenceHeight,
-    referenceStride ?? referenceWidth,
+    refStride,
   );
   for (var y = 0; y < chromaHeight; y++) {
     final dstRow = (chromaY + y) * dstStride + chromaX;
@@ -508,6 +621,50 @@ void writeChromaInterPrediction({
         (chromaX + x) * 8 + motionVector.x,
         referenceY,
       );
+    }
+  }
+}
+
+/// Copies an integer-sample prediction region with normative edge extension.
+///
+/// Most skip/direct partitions in ordinary video use integer motion. Handling
+/// those rows as typed-data ranges avoids constructing a sampler and doing
+/// coordinate division/clipping for every pixel. Border-crossing partitions
+/// retain the exact per-sample edge-extension behaviour.
+void _copyIntegerPrediction({
+  required Uint8List reference,
+  required int referenceWidth,
+  required int referenceHeight,
+  required int referenceStride,
+  required Uint8List destination,
+  required int destinationStride,
+  required int destinationX,
+  required int destinationY,
+  required int partitionWidth,
+  required int partitionHeight,
+  required int sourceX,
+  required int sourceY,
+}) {
+  final sourceInsideHorizontally =
+      sourceX >= 0 && sourceX + partitionWidth <= referenceWidth;
+  for (var row = 0; row < partitionHeight; row++) {
+    final clippedSourceY = _clipCoordinate(sourceY + row, referenceHeight);
+    final sourceRow = clippedSourceY * referenceStride;
+    final destinationStart =
+        (destinationY + row) * destinationStride + destinationX;
+    if (sourceInsideHorizontally) {
+      destination.setRange(
+        destinationStart,
+        destinationStart + partitionWidth,
+        reference,
+        sourceRow + sourceX,
+      );
+      continue;
+    }
+    for (var column = 0; column < partitionWidth; column++) {
+      final clippedSourceX = _clipCoordinate(sourceX + column, referenceWidth);
+      destination[destinationStart + column] =
+          reference[sourceRow + clippedSourceX];
     }
   }
 }
@@ -629,10 +786,90 @@ class _LumaSampler {
     return _average(horizontal, vertical);
   }
 
+  /// Samples an interior location whose complete six-tap footprint is known
+  /// to be in-picture.
+  int sampleUnclipped(int x, int y, int xFraction, int yFraction) {
+    if (yFraction == 0) {
+      final half = _horizontalHalfUnclipped(x, y);
+      if (xFraction == 2) return half;
+      return xFraction == 1
+          ? _average(_fullUnclipped(x, y), half)
+          : _average(half, _fullUnclipped(x + 1, y));
+    }
+
+    if (xFraction == 0) {
+      final half = _verticalHalfUnclipped(x, y);
+      if (yFraction == 2) return half;
+      return yFraction == 1
+          ? _average(_fullUnclipped(x, y), half)
+          : _average(half, _fullUnclipped(x, y + 1));
+    }
+
+    if (xFraction == 2 && yFraction == 2) {
+      return _diagonalHalfUnclipped(x, y);
+    }
+
+    if (xFraction == 2) {
+      final diagonal = _diagonalHalfUnclipped(x, y);
+      return yFraction == 1
+          ? _average(_horizontalHalfUnclipped(x, y), diagonal)
+          : _average(diagonal, _horizontalHalfUnclipped(x, y + 1));
+    }
+
+    if (yFraction == 2) {
+      final diagonal = _diagonalHalfUnclipped(x, y);
+      return xFraction == 1
+          ? _average(_verticalHalfUnclipped(x, y), diagonal)
+          : _average(diagonal, _verticalHalfUnclipped(x + 1, y));
+    }
+
+    final horizontal = _horizontalHalfUnclipped(x, yFraction == 1 ? y : y + 1);
+    final vertical = _verticalHalfUnclipped(xFraction == 1 ? x : x + 1, y);
+    return _average(horizontal, vertical);
+  }
+
   int _full(int x, int y) {
     final clippedX = _clipCoordinate(x, width);
     final clippedY = _clipCoordinate(y, height);
     return plane[clippedY * stride + clippedX];
+  }
+
+  int _fullUnclipped(int x, int y) => plane[y * stride + x];
+
+  int _horizontalRawUnclipped(int x, int y) {
+    final offset = y * stride + x;
+    return plane[offset - 2] -
+        5 * plane[offset - 1] +
+        20 * plane[offset] +
+        20 * plane[offset + 1] -
+        5 * plane[offset + 2] +
+        plane[offset + 3];
+  }
+
+  int _horizontalHalfUnclipped(int x, int y) =>
+      _clip8((_horizontalRawUnclipped(x, y) + 16) >> 5);
+
+  int _verticalHalfUnclipped(int x, int y) {
+    final offset = y * stride + x;
+    final value =
+        plane[offset - 2 * stride] -
+        5 * plane[offset - stride] +
+        20 * plane[offset] +
+        20 * plane[offset + stride] -
+        5 * plane[offset + 2 * stride] +
+        plane[offset + 3 * stride];
+    return _clip8((value + 16) >> 5);
+  }
+
+  int _diagonalHalfUnclipped(int x, int y) {
+    final value =
+        _horizontalRawUnclipped(x, y - 2) -
+        5 * _horizontalRawUnclipped(x, y - 1) +
+        20 * _horizontalRawUnclipped(x, y) +
+        20 * _horizontalRawUnclipped(x, y + 1) -
+        5 * _horizontalRawUnclipped(x, y + 2) +
+        _horizontalRawUnclipped(x, y + 3);
+    return _clip8((value + 512) >> 10);
   }
 
   int _horizontalRaw(int x, int y) =>

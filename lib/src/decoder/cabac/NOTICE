@@ -1,0 +1,49 @@
+H.264 CABAC normative table attribution
+========================================
+
+The CABAC arithmetic rules, slice-data binarizations, context derivations, and
+fixed numeric probability tables in this directory implement ITU-T
+Recommendation H.264 (08/2024), clauses 7.3.3, 7.3.5, 9.3.1, 9.3.3, and
+Tables 9-11 through 9-43, 9-44, and 9-45. The current slice-data layer is
+limited to progressive 4:2:0 syntax and the context range 0 through 459.
+
+The numeric tables and arithmetic behavior were cross-checked against:
+
+  Cisco OpenH264
+  https://github.com/cisco/openh264
+  codec/common/src/common_tables.cpp
+  codec/decoder/core/src/cabac_decoder.cpp
+  codec/decoder/core/src/parse_mb_syn_cabac.cpp
+  codec/decoder/core/inc/wels_common_basis.h
+
+OpenH264 is distributed under the following BSD 2-Clause licence:
+
+Copyright (c) 2013, Cisco Systems
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+FFmpeg's LGPL-2.1-or-later H.264 CABAC implementation was used only as an
+independent behavior cross-check:
+
+  https://github.com/FFmpeg/FFmpeg/blob/master/libavcodec/cabac.c
+  https://github.com/FFmpeg/FFmpeg/blob/master/libavcodec/h264_cabac.c

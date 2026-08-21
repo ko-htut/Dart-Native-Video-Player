@@ -398,5 +398,154 @@ void main() {
       );
       expect(destination, <int>[10, 10, 10, 10]);
     });
+
+    test(
+      'integer luma fast path preserves right and bottom edge extension',
+      () {
+        final reference = Uint8List.fromList(<int>[
+          10,
+          20,
+          30,
+          40,
+          50,
+          60,
+          70,
+          80,
+          90,
+        ]);
+        final destination = Uint8List(9);
+
+        writeLumaInterPrediction(
+          reference: reference,
+          referenceWidth: 3,
+          referenceHeight: 3,
+          destination: destination,
+          destinationWidth: 3,
+          destinationHeight: 3,
+          destinationX: 0,
+          destinationY: 0,
+          partitionWidth: 3,
+          partitionHeight: 3,
+          motionVector: const MotionVector(4, 4),
+        );
+
+        expect(destination, <int>[50, 60, 60, 80, 90, 90, 80, 90, 90]);
+      },
+    );
+
+    test('interior fractional luma writer matches the normative sampler', () {
+      final reference = Uint8List.fromList(<int>[
+        for (var y = 0; y < 24; y++)
+          for (var x = 0; x < 24; x++) (x * 13 + y * 31) & 0xff,
+      ]);
+
+      for (var yFraction = 0; yFraction < 4; yFraction++) {
+        for (var xFraction = 0; xFraction < 4; xFraction++) {
+          if (xFraction == 0 && yFraction == 0) continue;
+          final destination = Uint8List(24 * 24);
+          final motion = MotionVector(xFraction, yFraction);
+          writeLumaInterPrediction(
+            reference: reference,
+            referenceWidth: 24,
+            referenceHeight: 24,
+            destination: destination,
+            destinationWidth: 24,
+            destinationHeight: 24,
+            destinationX: 8,
+            destinationY: 8,
+            partitionWidth: 4,
+            partitionHeight: 4,
+            motionVector: motion,
+          );
+
+          for (var y = 0; y < 4; y++) {
+            for (var x = 0; x < 4; x++) {
+              expect(
+                destination[(8 + y) * 24 + 8 + x],
+                interpolateLumaQuarterPel(
+                  plane: reference,
+                  width: 24,
+                  height: 24,
+                  xQuarter: (8 + x) * 4 + motion.x,
+                  yQuarter: (8 + y) * 4 + motion.y,
+                ),
+                reason: 'fraction=($xFraction,$yFraction) sample=($x,$y)',
+              );
+            }
+          }
+        }
+      }
+    });
+
+    test('integer chroma fast path copies an in-picture partition', () {
+      final reference = Uint8List.fromList(<int>[
+        for (var y = 0; y < 4; y++)
+          for (var x = 0; x < 4; x++) x + y * 10,
+      ]);
+      final destination = Uint8List(16);
+
+      writeChromaInterPrediction(
+        reference: reference,
+        referenceWidth: 4,
+        referenceHeight: 4,
+        destination: destination,
+        destinationWidth: 4,
+        destinationHeight: 4,
+        destinationX: 0,
+        destinationY: 0,
+        partitionWidth: 4,
+        partitionHeight: 4,
+        motionVector: const MotionVector(8, 8),
+      );
+
+      expect(destination.sublist(0, 2), <int>[11, 12]);
+      expect(destination.sublist(4, 6), <int>[21, 22]);
+    });
+
+    test('fractional chroma partition matches the normative sampler', () {
+      final reference = Uint8List.fromList(<int>[
+        for (var y = 0; y < 8; y++)
+          for (var x = 0; x < 8; x++) (x * 17 + y * 29) & 0xff,
+      ]);
+
+      for (final motion in const <MotionVector>[
+        MotionVector(3, 0),
+        MotionVector(0, 5),
+        MotionVector(3, 5),
+        MotionVector(-3, -5),
+        MotionVector(11, 13),
+      ]) {
+        final destination = Uint8List(64);
+        writeChromaInterPrediction(
+          reference: reference,
+          referenceWidth: 8,
+          referenceHeight: 8,
+          destination: destination,
+          destinationWidth: 8,
+          destinationHeight: 8,
+          destinationX: 4,
+          destinationY: 4,
+          partitionWidth: 8,
+          partitionHeight: 8,
+          motionVector: motion,
+        );
+
+        for (var y = 0; y < 4; y++) {
+          for (var x = 0; x < 4; x++) {
+            expect(
+              destination[(2 + y) * 8 + 2 + x],
+              interpolateChromaEighthPel(
+                plane: reference,
+                width: 8,
+                height: 8,
+                xEighth: (2 + x) * 8 + motion.x,
+                yEighth: (2 + y) * 8 + motion.y,
+              ),
+              reason: 'motion=$motion sample=($x,$y)',
+            );
+          }
+        }
+      }
+    });
   });
 }
